@@ -10,7 +10,7 @@ from koemi.training.dataset import IGNORE_TARGET_ID
 from koemi.training.objective import calculate_training_objective
 
 
-class ObovObjectiveTests(unittest.TestCase):
+class Koemi3HIPObjectiveTests(unittest.TestCase):
     def build_model(self) -> KoemiModel:
         return KoemiModel(ModelSettings(embedding_size=16, memory_features=4, local_memory_size=4))
 

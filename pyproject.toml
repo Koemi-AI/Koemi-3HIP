@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "koemi"
-version = "0.2.0"
-description = "Koemi-2OBOV byte-level recurrent training architecture"
+version = "0.3.0"
+description = "Koemi-3HIP (Koemi-3 HERM Initial Phase) byte-level recurrent training architecture"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.1", "torch>=2.8"]

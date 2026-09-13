@@ -49,14 +49,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-2OBOV byte-level recurrent training base")
+    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-3HIP byte-level recurrent training base")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser("inspect-dataset", help="Validate and summarize JSON datasets")
     add_dataset_arguments(inspect_parser)
 
-    train_parser = subparsers.add_parser("train", help="Train a Koemi-2OBOV checkpoint from JSON datasets")
+    train_parser = subparsers.add_parser("train", help="Train a Koemi-3HIP checkpoint from JSON datasets")
     add_dataset_arguments(train_parser)
     train_parser.add_argument("--checkpoint", required=True, help="Output checkpoint path")
     train_parser.add_argument("--overwrite", action="store_true", help="Replace an existing checkpoint")
@@ -81,7 +81,7 @@ def create_parser() -> argparse.ArgumentParser:
     add_offload_arguments(train_parser)
     add_model_arguments(train_parser)
 
-    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-2OBOV checkpoint")
+    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-3HIP checkpoint")
     generate_parser.add_argument("--checkpoint", required=True, help="Checkpoint path")
     generate_parser.add_argument("--prompt", required=True, help="User text used to start generation")
     generate_parser.add_argument("--system", default=None, help="System text placed before the user text")

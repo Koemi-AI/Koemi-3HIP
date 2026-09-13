@@ -1,6 +1,6 @@
-# Koemi-2OBOV
+# Koemi-3HIP
 
-Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
+Koemi-3HIP (Koemi-3 HERM Initial Phase) is a PyTorch training base for byte-level causal models built on
 HERM (Hierarchical Error-Refined Memory): bounded recurrent state, rank-one
 associative memory, exact recent and salient recall, and optional deterministic
 experts. The slower refine tier is opt-in.
@@ -72,7 +72,7 @@ verification.
 ```bash
 .venv/bin/python -m koemi train \
   --dataset examples/canonical.jsonl \
-  --checkpoint artifacts/koemi-2obov.pt \
+  --checkpoint artifacts/koemi-3hip.pt \
   --overwrite \
   --expert-count 2 \
   --thinking-loss-weight 2.0
@@ -88,7 +88,7 @@ content is never logged.
 
 ```bash
 .venv/bin/python -m koemi generate \
-  --checkpoint artifacts/koemi-2obov.pt \
+  --checkpoint artifacts/koemi-3hip.pt \
   --system "Answer in one sentence." \
   --prompt "Explain FIFO." \
   --max-new-bytes 64 \
@@ -144,6 +144,20 @@ flowchart LR
     MoE --> Output[Linear byte predictor]
 ```
 
+### Read the system in four diagrams
+
+These figures are deliberately operational: each box names a component that
+exists in this repository, and every claim is bounded by the tests and
+measurements documented below.
+
+![Koemi-3HIP HERM ecosystem overview](assets/koemi-3hip-herm-ecosystem.png)
+
+![HERM memory hierarchy and equations](assets/herm-memory-hierarchy.png)
+
+![Koemi-3HIP runtime and prefix reuse](assets/koemi-3hip-runtime.png)
+
+![Current limits and validation plan](assets/koemi-3hip-limits.png)
+
 ### HERM memory choices
 
 HERM uses four decisions inspired by the memory perspective in [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/):
@@ -158,6 +172,136 @@ The current implementation is a research base, not a reimplementation of
 Titans. The Google overview identifies Titans as a concrete architecture and
 MIRAS as the broader framework; Titans uses a deeper online-updated neural
 memory than HERM does.
+
+HERM is not a claim that recurrence has solved long-context intelligence. It is
+an engineering hypothesis: keep the causal state width fixed, combine a learned
+compressed memory with a few exact bounded slots, and measure the trade-off.
+
+### One token, formally
+
+At position `t`, the model performs the following causal sequence. No operation
+uses the target byte that training will score at the next step.
+
+1. Embed the byte and normalize it: `u_t = RMSNorm(Embedding(x_t))`.
+2. Update the bounded recurrent state:
+
+   ```text
+   a_t = eps_a + (1 - 2 eps_a) sigmoid(W_a u_t + b_a)
+   g_t = (1 - a_t) tanh(W_g u_t + b_g)
+   h_t = a_t * h_(t-1) + g_t
+   ```
+
+   `a_t` is constrained to `(eps_a, 1-eps_a)`. The state therefore decays
+   smoothly instead of exploding or being overwritten in one step.
+
+3. Produce memory keys, values, features and a bounded write weight:
+
+   ```text
+   k_t = W_k h_t
+   v_t = W_v h_t
+   phi_t = softmax(W_phi k_t + b_phi)
+   lambda_t = eps_d + (1 - 2 eps_d) sigmoid(W_d h_t + b_d)
+   w_t = sigmoid(W_w h_t + b_w)
+   ```
+
+   Here `phi_t` is a positive feature distribution. The outer product
+   `v_t phi_t^T` writes one rank-one association rather than a full new matrix.
+
+4. Read the previous memory state before writing the current token:
+
+   ```text
+   q_t = W_q h_t
+   psi_t = softmax(W_phi q_t + b_phi)
+   den_t = c_(t-1)^T psi_t
+   raw_t = B_(t-1) psi_t / (den_t + eps_m)
+   confidence_t = den_t / (den_t + eps_m)
+   m_t = confidence_t * raw_t
+   ```
+
+   The denominator is evidence that the query matches stored features. The
+   confidence multiplier makes an empty memory say “no evidence” instead of
+   turning division by `eps_m` into a 256x noise amplifier.
+
+5. Update the fast memory and, when `--ablation herm` is selected, the slow
+   residual memory:
+
+   ```text
+   B_t = lambda_t B_(t-1) + w_t v_t phi_t^T
+   c_t = lambda_t c_(t-1) + w_t phi_t
+   r_t = v_t - m_t
+   ```
+
+   The slow tier applies the same bounded scan to a residual with a slower
+   decay. `no_refine` skips its compute by default; it does not pretend that a
+   zero-cost tier has produced quality.
+
+### Same equations, two audiences
+
+In plain language, HERM keeps a small notebook (`h_t`), compresses repeated
+patterns into a learned index (`B_t, c_t`), stores a slower correction (`R_t`),
+and keeps a few exact recent or surprising details in bounded rings. In linear
+algebra, it is a causal rank-one state-space update with normalized feature
+contractions and no sequence-length-sized persistent state.
+
+The parallel path evaluates a chunk using the closed form
+
+```text
+B_t = Lambda_t B_0 + sum_(s<=t) (Lambda_t/Lambda_s) w_s v_s phi_s^T
+```
+
+and computes all causal query/write interactions through a `[B,C,C]` matrix,
+where `C` is the chunk length. It returns only reads and the final state. The
+sequential path applies the recurrence token by token and remains the oracle.
+`tests/model/test_associative_read.py` and `tests/model/test_execution.py`
+compare both paths, including gradients.
+
+### Exact detail and salience
+
+The local ring retains the latest `W` projected key/value pairs. The salient
+ring admits a token when `surprise_t > tau` and retains the latest `S` admitted
+pairs, even when they are far outside the local window. Both reads are causal:
+the query at `t` can see carried entries and current entries with index `< t`,
+never a future token. `S=16` and `tau=0.75` are implementation defaults, not a
+quality optimum; the required threshold/capacity sweep is still open.
+
+### Training objective and reported numbers
+
+For a supervised target byte `y_t`, the model minimizes causal cross-entropy:
+
+```text
+loss = - (1/N) sum_t log softmax(logits_t)[y_t]
+bpb = loss / log(2)
+perplexity = exp(loss)
+```
+
+Thinking bytes can receive a separate non-negative weight, but visible thinking
+text is not treated as a hidden chain of thought. Every run reports supervised
+token count, thinking-token count, loss, thinking loss, validation loss when
+available, perplexity, learning rate, optimizer steps, precision and tokens/s.
+
+### Hardware, RAM and SSD responsibilities
+
+- CPU/GPU tensors execute the model. The CPU path is the currently measured path;
+  CUDA and AMP are supported by configuration but require a CUDA host for proof.
+- RAM holds active parameters and the fixed-width `KoemiState`. A state does not
+  grow with conversation length.
+- The RAM warm cache stores detached embeddings by token id. It is disabled in
+  training because optimizer updates would make detached values stale.
+- The opt-in SSD prefix ledger stores tensor-only snapshots at scan boundaries.
+  A request finds the longest byte-identical prefix, restores its state and runs
+  only the suffix. This is exact reuse, not semantic retrieval.
+- Parameter offload has accelerator, host and disk tiers. Disk saves memory but
+  adds I/O; it is not a speed optimization. Frozen parameters are required for
+  the disk tier.
+
+### What Koemi is — and is not
+
+Koemi-3HIP is an ambitious research implementation with executable contracts,
+not a Transformer replacement today. It currently provides a bounded causal
+state, associative and exact memory paths, deterministic runtime behavior,
+prefix reuse and reproducible CPU measurements. It does not yet establish
+Transformer-level quality, arbitrary long-context recall, CUDA/FP16 speed, or a
+quality gain from salience. Those are explicit experiments, not implied claims.
 
 For positive features `phi`, the fast tier computes an epsilon-regularized read
 and multiplies it by
@@ -304,17 +448,36 @@ materialization counters, so a plan can be checked against the machine it ran on
 
 ## Benchmark
 
+The ready-to-run English analysis notebook is
+[`notebooks/Koemi-3HIP_Analysis.ipynb`](notebooks/Koemi-3HIP_Analysis.ipynb). It
+contains the bounded causal evaluator, explicit answer/thinking denominators,
+moving-median curves and a monochrome pastel-yellow report style. Point
+`RUN_LOG` at a JSONL training log after a run; missing series are reported as
+missing rather than fabricated.
+
 ```bash
-.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-obov.json
-.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
+.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
+.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json
 .venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
 ```
 
-The harness compares OBOV with parameter-matched GRU and LSTM baselines. The
+The harness compares Koemi-3HIP with parameter-matched GRU and LSTM baselines. The
 old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
-and are not OBOV results. The ablation runner requires at least three seeds and
+and are not Koemi-3HIP results. The ablation runner requires at least three seeds and
 reports mean and standard deviation. The affine control is the minimum quality
 baseline; a small-budget single-seed run is not evidence of memory capacity.
+
+### Legacy training, before Koemi became HIP
+
+The following plot belongs to the pre-HIP training line. It is preserved as a
+historical record, not presented as current Koemi-3HIP evidence:
+
+![Legacy pre-HIP training curves](assets/legacy-pre-hip-training-curves.png)
+
+The old run shows loss decreasing while answer BPB remains noisy and throughput
+oscillates during training. It is useful for understanding where the project
+came from; it does not measure the current prefix ledger, rank-one chunk read,
+confidence gate or salient ring.
 
 ## Known limitations
 
@@ -358,7 +521,7 @@ src/koemi/
   model/          HERM state, memory, cache, scan and deterministic MoE
   runtime/        parameter offload: traffic calibration, tiers, disk store
   training/       Causal chunks, objective, trainer, checkpoint and generation
-benchmarks/       OBOV against parameter-matched GRU and LSTM baselines
+benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs
 ```

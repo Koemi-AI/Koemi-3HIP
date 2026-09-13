@@ -1,6 +1,6 @@
-# Koemi-2OBOV architecture
+# Koemi-3HIP architecture
 
-Koemi-2OBOV is the current research architecture for training causal models in
+Koemi-3HIP (Koemi-3 HERM Initial Phase) is the current research architecture for training causal models in
 the Koemi infrastructure. Its state family is HERM (Hierarchical Error-Refined
 Memory). HERM is an architecture and runtime mechanism; it is not a trained
 model by itself.
@@ -15,7 +15,7 @@ path as a numerical oracle for the parallel path.
 The project takes its memory vocabulary from [Titans + MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/).
 MIRAS separates memory architecture, attentional bias, retention gate and
 memory algorithm. Titans is a concrete architecture that uses an online-updated
-neural memory. KSM currently uses a bounded diagonal associative state and does
+neural memory. Koemi-3HIP currently uses a bounded associative state and does
 not claim to reproduce Titans.
 
 ## Non-goals
@@ -168,7 +168,7 @@ y_t = RMSNorm(z_t + FFN_e_t(z_t))
 
 Exactly one expert processes each valid token. There is no routing projection,
 risk head, top-k selector, soft mixture or routing loss. This is a deliberate
-trade-off: KSM has a predictable sparse expert bank, not learned semantic MoE
+trade-off: Koemi-3HIP has a predictable sparse expert bank, not learned semantic MoE
 dispatch. `expert_count = 0` skips the bank entirely.
 
 Absolute position is excluded so a repeated bigram has a stable expert. The
@@ -200,7 +200,7 @@ as a hidden cognition claim.
 
 ## Cache tiers and chains
 
-KSM has explicit cache tiers:
+Koemi-3HIP has explicit cache tiers:
 
 | Tier | Location | Content | Reuse rule |
 | --- | --- | --- | --- |
@@ -244,7 +244,7 @@ performance claim.
 Training defaults to CUDA when available in the CLI and falls back to CPU. The
 model does not allocate a second deep path, so removing routing reduces
 parameters and intermediate tensors directly. Actual speed and VRAM changes
-must be measured by the OBOV benchmark.
+must be measured by the Koemi-3HIP benchmark.
 
 ## Implementation status
 
@@ -267,7 +267,7 @@ must be measured by the OBOV benchmark.
 
 - MQAR, copy and needle recall at a budget where at least one baseline solves
   the task;
-- OBOV versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
+- Koemi-3HIP versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
   tokenizer, parameter count, token budget, precision and device;
 - p50/p95 training and decode throughput, peak VRAM/RAM and state bytes;
 - ablations for `expert_count`, local window, memory feature width and cache
@@ -275,5 +275,5 @@ must be measured by the OBOV benchmark.
 - cache invalidation, corruption, retention and cross-session isolation tests;
 - NaN/Inf, state norm, surprise distribution and write-rate reports.
 
-Until those gates run, KSM is a research hypothesis with executable contracts,
+Until those gates run, Koemi-3HIP is a research hypothesis with executable contracts,
 not evidence that Koemi models are comparable to a production AI system.

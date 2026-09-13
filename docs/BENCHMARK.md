@@ -1,7 +1,8 @@
 # Koemi benchmark ledger
 
-This file separates historical Koemi-1FPA measurements from Koemi-2OBOV
-measurements. The old numbers must not be quoted as OBOV results.
+This file separates historical Koemi-1FPA and pre-HIP HERM measurements from
+current Koemi-3HIP measurements. The old numbers must not be quoted as current
+Koemi-3HIP results.
 
 ## Historical Koemi-1FPA run
 
@@ -21,9 +22,9 @@ threads on Windows 10. The run used 48 training records, 16 evaluation records,
 No model solved the recall task at this budget. These measurements separated
 optimization behavior, not architectural ceilings. The old Koemi router sent
 0.10% of `bytes` tokens and 1.56% of `recall` tokens to its deep path, with no
-measurable loss gain. That machinery was removed from OBOV.
+measurable loss gain. That machinery was removed from Koemi-3HIP.
 
-## Koemi-2OBOV HERM smoke run
+## Legacy HERM smoke run (before Koemi became HIP)
 
 Measured on 2026-09-12 with PyTorch 2.14.0+cpu and four CPU threads. This is a
 single small recall smoke run: 16 training records, 8 evaluation records, 96
@@ -31,8 +32,8 @@ positions, batch size 4 and one epoch. It is diagnostic, not a quality claim.
 
 | Model | Bits/byte | Eval loss | Train tokens/s | Eval tokens/s | Parameters | State bytes/sequence |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Koemi-2OBOV HERM (bytes) | 6.095 | 4.225 | 878.1 | 3,236.1 | 27,756 | 4,304 |
-| Koemi-2OBOV HERM | 7.552 | 5.235 | 102.6 | 356.9 | 27,756 | 4,304 |
+| Legacy HERM (bytes, pre-HIP) | 6.095 | 4.225 | 878.1 | 3,236.1 | 27,756 | 4,304 |
+| Legacy HERM (pre-HIP) | 7.552 | 5.235 | 102.6 | 356.9 | 27,756 | 4,304 |
 
 The immediately preceding same-budget Koemi snapshot measured 7.722 bits/byte,
 5.352 eval loss, 91.1 train tokens/s, 353.3 eval tokens/s, 27,660 parameters and
@@ -43,7 +44,7 @@ are useful as an early regression signal.
 
 ### Recall sample-size check
 
-The same HERM configuration was evaluated with 1,024 records (3,072
+The same legacy HERM configuration was evaluated with 1,024 records (3,072
 supervised bytes), producing `5.429 nats = 7.833 bpb +/- 0.015 bpb` standard
 error. The earlier 48-token evaluation produced `7.552 bpb`; it was too small
 to support a quality conclusion. Reports now include processed-token count,
@@ -94,14 +95,14 @@ not memory capacity.
 Commands:
 
 ```bash
-.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-obov.json
-.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-obov.json
+.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
+.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json
 ```
 
 The updated harness reports loss, bits per byte, both token denominators,
 standard error, training/evaluation throughput, peak resident memory, state
 bytes and fixed expert activations. It
-does not report route fraction or router accuracy because OBOV has neither.
+does not report route fraction or router accuracy because Koemi-3HIP has neither.
 
 ## Rank-one chunk and prefix-ledger probe
 
@@ -146,6 +147,6 @@ Do not infer semantic cache quality from exact mapping-cache hits.
 
 ## Interpretation boundary
 
-OBOV is a training architecture and runtime experiment. A passing unit test
+Koemi-3HIP is a training architecture and runtime experiment. A passing unit test
 proves a contract such as scan equivalence or cache isolation; it does not prove
 that the trained model remembers arbitrary facts or matches a Transformer.

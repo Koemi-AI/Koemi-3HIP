@@ -29,7 +29,7 @@ class CliOutputTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
-    def test_trains_and_generates_with_obov_flags(self) -> None:
+    def test_trains_and_generates_with_koemi_3hip_flags(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
             dataset_path = workspace / "dataset.jsonl"
