@@ -8,7 +8,21 @@ from koemi.model.layers import GatedFeedForward, RootMeanSquareNorm
 
 TOKEN_HASH_FACTOR = 1_000_003
 PREVIOUS_TOKEN_HASH_FACTOR = 97_409
-POSITION_HASH_FACTOR = 65_537
+HASH_WIDTH_MASK = 0xFFFFFFFF
+HASH_MIX_MULTIPLIER = 0x45D9F3B
+HASH_MIX_SHIFT = 16
+UNASSIGNED_EXPERT = -1
+
+
+def content_dispatch_hash(token_ids: Tensor, previous_token_ids: Tensor) -> Tensor:
+    value = (
+        token_ids * TOKEN_HASH_FACTOR + previous_token_ids * PREVIOUS_TOKEN_HASH_FACTOR
+    ) & HASH_WIDTH_MASK
+    value = value ^ (value >> HASH_MIX_SHIFT)
+    value = (value * HASH_MIX_MULTIPLIER) & HASH_WIDTH_MASK
+    value = value ^ (value >> HASH_MIX_SHIFT)
+    value = (value * HASH_MIX_MULTIPLIER) & HASH_WIDTH_MASK
+    return value ^ (value >> HASH_MIX_SHIFT)
 
 
 class DeterministicExpertMixture(nn.Module):
@@ -23,17 +37,11 @@ class DeterministicExpertMixture(nn.Module):
         context: Tensor,
         token_ids: Tensor,
         previous_token_ids: Tensor,
-        positions: Tensor,
         valid_mask: Tensor,
     ) -> tuple[Tensor, Tensor]:
         if self.expert_count == 0:
-            return context, torch.full_like(token_ids, -1)
-        context_hash = (
-            token_ids * TOKEN_HASH_FACTOR
-            + previous_token_ids * PREVIOUS_TOKEN_HASH_FACTOR
-            + positions * POSITION_HASH_FACTOR
-        )
-        assignment = context_hash.remainder(self.expert_count).masked_fill(~valid_mask, -1)
+            return context, torch.full_like(token_ids, UNASSIGNED_EXPERT)
+        assignment = self.assign(token_ids, previous_token_ids, valid_mask)
         flattened_context = context.reshape(-1, context.shape[-1])
         flattened_assignment = assignment.reshape(-1)
         mixed_context = context.reshape(-1, context.shape[-1]).clone()
@@ -48,5 +56,6 @@ class DeterministicExpertMixture(nn.Module):
             mixed_context.index_copy_(0, row_indices, updated_context)
         return mixed_context.reshape_as(context), assignment
 
-    def activation_counts(self, assignment: Tensor) -> tuple[int, ...]:
-        return tuple(int((assignment == expert_index).sum()) for expert_index in range(self.expert_count))
+    def assign(self, token_ids: Tensor, previous_token_ids: Tensor, valid_mask: Tensor) -> Tensor:
+        context_hash = content_dispatch_hash(token_ids, previous_token_ids)
+        return context_hash.remainder(self.expert_count).masked_fill(~valid_mask, UNASSIGNED_EXPERT)

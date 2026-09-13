@@ -96,8 +96,8 @@ class KoemiModelTests(unittest.TestCase):
         model = self.build_model(expert_count=4)
         input_ids = torch.tensor([[65, 66, 67, PAD_TOKEN_ID]], dtype=torch.long)
         output = model(input_ids)
-        self.assertEqual([1, 1, 0, 1], list(output.expert_activation_counts))
-        self.assertEqual([3, 0, 1, -1], output.expert_indices[0].tolist())
+        self.assertEqual([2, 1, 0, 0], list(output.expert_activation_counts))
+        self.assertEqual([1, 0, 0, -1], output.expert_indices[0].tolist())
         self.assertEqual(3, sum(output.expert_activation_counts))
 
     def test_warm_cache_preserves_logits_and_reports_reuse(self) -> None:

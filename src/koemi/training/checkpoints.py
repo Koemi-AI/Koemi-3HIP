@@ -10,7 +10,7 @@ from koemi.configuration.settings import ModelSettings
 from koemi.model.network import KoemiModel
 
 
-CHECKPOINT_FORMAT_VERSION = 5
+CHECKPOINT_FORMAT_VERSION = 6
 
 
 @dataclass(frozen=True)

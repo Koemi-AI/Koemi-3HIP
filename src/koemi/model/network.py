@@ -207,16 +207,10 @@ class KoemiModel(nn.Module):
         )
         fused_context = self.fuse(working_states, memory_value, local_value)
         previous_token_ids = self.previous_token_ids(input_ids, valid_mask, current_state.last_token_ids)
-        positions = torch.arange(
-            current_state.step_index,
-            current_state.step_index + length,
-            device=input_ids.device,
-        ).unsqueeze(0).expand_as(input_ids)
         final_context, expert_indices = self.experts(
             fused_context,
             input_ids,
             previous_token_ids,
-            positions,
             valid_mask,
         )
         logits = self.predict_tokens(final_context)
@@ -363,12 +357,10 @@ class KoemiModel(nn.Module):
                 else self.refine_memory(working_state, fast_memory, refine_memory, local_value)
             )
             fused_context = self.fuse(working_state, memory_value, local_value)
-            positions = torch.full_like(token_ids, current_state.step_index)
             final_context, expert_indices = self.experts(
                 fused_context.unsqueeze(1),
                 token_ids.unsqueeze(1),
                 current_state.last_token_ids.unsqueeze(1),
-                positions.unsqueeze(1),
                 valid_mask.unsqueeze(1),
             )
             logits_by_position.append(self.predict_tokens(final_context[:, 0]))
