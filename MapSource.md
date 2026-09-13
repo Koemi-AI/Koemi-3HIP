@@ -1194,6 +1194,31 @@ weights.
   directly to `sys.path`; the notebook no longer depends on editable-install
   resolution in Colab.
 
+### 2026-09-13 - complete T4 notebook rewrite from repository contracts
+
+- Replaced `notebooks/Koemi-3HIP_T4_Overnight.ipynb` instead of extending the
+  previous runbook. The new cells follow the current `DatasetRecord`, marker,
+  `CausalByteDataset`, `TrainingObjective`, `KoemiState`, cache and parallel /
+  sequential execution contracts.
+- The setup clones the repository, prepends `/content/Koemi-3HIP/src` before
+  importing `koemi`, installs only the notebook-side `datasets`, `pandas` and
+  `matplotlib` dependencies, and mounts Drive for resumable results.
+- The runbook now audits rejected remote rows instead of dropping them silently,
+  keeps the record-level seed split, uses the documented `scan_chunk=128` default,
+  probes a real FP16 forward/backward batch size, mirrors gradient accumulation
+  and warmup/cosine scheduling, and writes model/optimizer/scaler checkpoints.
+- It reports causal/task/answer/thinking losses with independent denominators,
+  token-level standard errors, p50/p95 CUDA timings, state norms and bytes,
+  non-finite gradients, memory peaks, deterministic top-k load entropy/Gini,
+  parallel-vs-sequential equivalence, zero-evidence confidence, exact prefix
+  reuse, warm-token cache statistics, generation output, a CLI-compatible
+  `CheckpointStore` model checkpoint and a final zip archive.
+- During the rewrite, a public README sentence that had been accidentally
+  concatenated to the MoE section was restored; no benchmark claim changed.
+- Static verification after the rewrite: notebook JSON parsed, all nine code
+  cells compiled, `compileall` passed, and the full suite passed 149 tests with
+  one CUDA skip. Actual CUDA/Drive/dataset execution remains a Colab-only gate.
+
 ## Suspicion zone
 
 - **KOEMI-020** — `src/koemi/model/experts.py:59-73` — condition: the six

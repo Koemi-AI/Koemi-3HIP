@@ -337,8 +337,8 @@ is indistinguishable from uniform random; a 64-expert run on real data reported
 0.92. Dispatch on content alone gives 161.08, so the assignment now carries
 information. No expert is left idle and every expert receives between 10 and 29
 distinct bigrams. The busiest expert holds 3.3 times the uniform share; that skew
-is the skew of byte-bigram frequency, and it costs nothing because every token
-With `--expert-top-k 1`, every valid token passes through exactly one expert. A
+is the skew of byte-bigram frequency. With `--expert-top-k 1`, every valid token
+passes through exactly one expert. A
 `128/6` run is an explicit high-capacity experiment: six deterministic experts are
 active per token and all 128 experts are trainable. It is not the default and its
 load balance must be measured rather than assumed.
