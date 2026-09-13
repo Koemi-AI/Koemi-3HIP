@@ -11,6 +11,7 @@ import torch
 from koemi.configuration.settings import ModelSettings, TrainingSettings
 from koemi.data.adapters import SUPPORTED_DATASET_FORMATS
 from koemi.data.readers import DatasetLoadReport, load_dataset_records, split_dataset_records
+from koemi.data.serialization import build_answer_prompt, build_thinking_prompt, strip_prompt
 from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
@@ -82,7 +83,19 @@ def create_parser() -> argparse.ArgumentParser:
 
     generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-2OBOV checkpoint")
     generate_parser.add_argument("--checkpoint", required=True, help="Checkpoint path")
-    generate_parser.add_argument("--prompt", required=True, help="Text used to start generation")
+    generate_parser.add_argument("--prompt", required=True, help="User text used to start generation")
+    generate_parser.add_argument("--system", default=None, help="System text placed before the user text")
+    generate_parser.add_argument(
+        "--prompt-target",
+        choices=("answer", "thinking"),
+        default="answer",
+        help="Span the model is asked to continue",
+    )
+    generate_parser.add_argument(
+        "--raw-prompt",
+        action="store_true",
+        help="Send --prompt verbatim, without the training role markers",
+    )
     generate_parser.add_argument("--max-new-bytes", type=int, default=128)
     generate_parser.add_argument("--temperature", type=float, default=1.0)
     generate_parser.add_argument("--device", default="cpu")
@@ -305,6 +318,16 @@ def attach_inference_offload(
     return engine
 
 
+def resolve_prompt(arguments: argparse.Namespace) -> str:
+    if arguments.raw_prompt:
+        if arguments.system is not None:
+            raise ValueError("--system cannot be combined with --raw-prompt")
+        return arguments.prompt
+    if arguments.prompt_target == "thinking":
+        return build_thinking_prompt(arguments.system, arguments.prompt)
+    return build_answer_prompt(arguments.system, arguments.prompt)
+
+
 def generate_completion(arguments: argparse.Namespace, logger) -> int:
     loaded_checkpoint = CheckpointStore().load(arguments.checkpoint, arguments.device)
     cache_capacity = arguments.cache_capacity or loaded_checkpoint.model_settings.cache_capacity
@@ -325,14 +348,13 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     if mapping_cache is not None and arguments.clear_mapping_cache:
         logger.info("mapping_cache_cleared entries=%s", mapping_cache.clear())
     tokenizer = ByteTokenizer()
-    engine = attach_inference_offload(
-        loaded_checkpoint.model, tokenizer, arguments.prompt, arguments, logger
-    )
+    prompt = resolve_prompt(arguments)
+    engine = attach_inference_offload(loaded_checkpoint.model, tokenizer, prompt, arguments, logger)
     try:
         completion = generate_text(
             loaded_checkpoint.model,
             tokenizer,
-            arguments.prompt,
+            prompt,
             arguments.max_new_bytes,
             arguments.temperature,
             arguments.device,
@@ -343,6 +365,8 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         if engine is not None:
             log_offload(engine, logger)
             engine.detach()
+    if not arguments.raw_prompt:
+        completion = strip_prompt(completion, prompt)
     statistics = warm_cache.statistics()
     mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
     logger.info(

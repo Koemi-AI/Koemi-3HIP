@@ -33,6 +33,7 @@ this shape:
 ```json
 {
   "id": "queue-001",
+  "system": "Answer in one sentence.",
   "input": "Explain FIFO in one sentence.",
   "thinking": "A queue preserves arrival order.",
   "output": "FIFO means first in, first out.",
@@ -43,6 +44,15 @@ this shape:
 `thinking` is optional. Its bytes receive a separate target mask and can be
 weighted with `--thinking-loss-weight`. The mask does not claim that visible
 thinking text is an internal reasoning trace.
+
+`system` is optional and is context, never a target. Its bytes precede the input
+span and carry no supervision, so the model conditions on the instruction and is
+never trained to reproduce it. A record without `system` serializes to exactly the
+same bytes as before the field existed, which a test asserts, so datasets and
+checkpoints from earlier runs stay valid. A ShareGPT `system` turn now maps to this
+field instead of being rejected; several system turns join with a newline in the
+order they appear, and a top-level `system` field applies only when the
+conversation carries no system turn.
 
 For plain text, set `output` to `null`; the complete `input` becomes the causal
 training sequence. Alpaca and ShareGPT records enter through validated adapters.
@@ -77,13 +87,28 @@ content is never logged.
 ```bash
 .venv/bin/python -m koemi generate \
   --checkpoint artifacts/koemi-2obov.pt \
-  --prompt "FIFO means" \
+  --system "Answer in one sentence." \
+  --prompt "Explain FIFO." \
   --max-new-bytes 64 \
   --cache-capacity 256 \
   --mapping-cache D:\\koemi-cache \
   --mapping-cache-namespace local-session \
   --mapping-cache-ttl-seconds 3600
 ```
+
+`--prompt` carries the user text alone. The command wraps it in the same role
+markers the trainer wrote, so at inference the model sees the exact byte prefix it
+saw during training. A test asserts that equality directly: the built prompt equals
+the serialized record's bytes up to its first supervised position.
+
+Only the continuation reaches stdout. The prefix the model was conditioned on is
+stripped, and stripping fails loudly rather than silently when the generated text
+does not start with it.
+
+`--prompt-target thinking` ends the prefix at the thinking marker instead of the
+output marker, for a checkpoint trained with thinking spans. `--raw-prompt` sends
+`--prompt` verbatim and prints the whole text, which is what a checkpoint trained
+on plain text needs; combining it with `--system` is refused.
 
 The RAM cache reuses detached embeddings by token id. The optional mapping
 cache stores the output and recurrent state for an exact input sequence under an
@@ -226,6 +251,9 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--offload-accelerator-mib` | unlimited | Parameter budget kept on the compute device. |
 | `--offload-host-mib` | unlimited | Parameter budget streamed from host memory. |
 | `--offload-store` | none | Directory for parameters evicted to storage. |
+| `--system` | none | System text placed before the user text at inference. |
+| `--prompt-target` | `answer` | `answer` or `thinking`: which span the model continues. |
+| `--raw-prompt` | off | Send `--prompt` verbatim, without the role markers. |
 | `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
 | `--gradient-accumulation-steps` | `1` | Microbatches per optimizer update. |
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |

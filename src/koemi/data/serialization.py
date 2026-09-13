@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from koemi.data.contracts import DatasetRecord
 
 
+SYSTEM_MARKER = "<|system|>\n"
 INPUT_MARKER = "<|input|>\n"
 THINKING_MARKER = "\n<|thinking|>\n"
 OUTPUT_MARKER = "\n<|output|>\n"
@@ -17,15 +18,37 @@ class SerializedRecord:
     thinking_positions: tuple[bool, ...]
 
 
+def system_prefix(system_text: str | None) -> str:
+    if system_text is None:
+        return ""
+    return f"{SYSTEM_MARKER}{system_text}\n"
+
+
+def build_answer_prompt(system_text: str | None, user_text: str) -> str:
+    return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{OUTPUT_MARKER}"
+
+
+def build_thinking_prompt(system_text: str | None, user_text: str) -> str:
+    return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{THINKING_MARKER}"
+
+
+def strip_prompt(generated_text: str, prompt: str) -> str:
+    if not generated_text.startswith(prompt):
+        raise ValueError("the generated text does not start with the prompt it was conditioned on")
+    return generated_text[len(prompt) :]
+
+
 def serialize_record(record: DatasetRecord) -> SerializedRecord:
+    prefix = system_prefix(record.system_text).encode("utf-8")
     if record.output_text is None:
-        token_bytes = record.input_text.encode("utf-8")
+        body = record.input_text.encode("utf-8")
         return SerializedRecord(
-            token_bytes,
-            tuple(True for _ in token_bytes),
-            tuple(False for _ in token_bytes),
+            prefix + body,
+            tuple(False for _ in prefix) + tuple(True for _ in body),
+            tuple(False for _ in prefix + body),
         )
     segments: list[tuple[bytes, bool, bool]] = [
+        (prefix, False, False),
         (INPUT_MARKER.encode("utf-8"), False, False),
         (record.input_text.encode("utf-8"), False, False),
     ]
@@ -50,3 +73,11 @@ def serialize_record(record: DatasetRecord) -> SerializedRecord:
         is_thinking for segment, _, is_thinking in segments for _ in segment
     )
     return SerializedRecord(token_bytes, supervised_positions, thinking_positions)
+
+
+def supervised_prefix_bytes(record: DatasetRecord) -> bytes:
+    serialized = serialize_record(record)
+    for position, is_supervised in enumerate(serialized.supervised_positions):
+        if is_supervised:
+            return serialized.token_bytes[:position]
+    return serialized.token_bytes

@@ -15,3 +15,4 @@ class DatasetRecord:
     thinking_text: str | None
     output_text: str | None
     metadata: dict[str, Any]
+    system_text: str | None = None

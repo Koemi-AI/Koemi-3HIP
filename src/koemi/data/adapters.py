@@ -76,7 +76,14 @@ class CanonicalRecordAdapter:
             raise DatasetValidationError("field 'thinking' requires a string 'output'")
         if not input_text and output_text is None:
             raise DatasetValidationError("record must contain input text or output text")
-        return DatasetRecord(identifier, input_text, thinking_text, output_text, read_metadata(raw_record))
+        return DatasetRecord(
+            identifier,
+            input_text,
+            thinking_text,
+            output_text,
+            read_metadata(raw_record),
+            optional_string(raw_record.get("system"), "system"),
+        )
 
 
 @dataclass(frozen=True)
@@ -97,6 +104,7 @@ class AlpacaRecordAdapter:
             optional_string(raw_record.get("thinking"), "thinking"),
             output_text,
             read_metadata(raw_record),
+            optional_string(raw_record.get("system"), "system"),
         )
 
 
@@ -111,7 +119,9 @@ class ShareGptRecordAdapter:
         raw_conversations = raw_record.get("conversations")
         if not isinstance(raw_conversations, Sequence) or isinstance(raw_conversations, (str, bytes)):
             raise DatasetValidationError("field 'conversations' must be an array")
-        conversations = [self.read_turn(turn, index) for index, turn in enumerate(raw_conversations)]
+        turns = [self.read_turn(turn, index) for index, turn in enumerate(raw_conversations)]
+        system_turns = [turn.content for turn in turns if turn.role == "system"]
+        conversations = [turn for turn in turns if turn.role != "system"]
         assistant_positions = [index for index, turn in enumerate(conversations) if turn.role == "assistant"]
         if not assistant_positions:
             raise DatasetValidationError("field 'conversations' must contain an assistant response")
@@ -119,7 +129,12 @@ class ShareGptRecordAdapter:
         output_text = conversations[response_index].content
         input_turns = conversations[:response_index]
         input_text = "\n".join(f"{turn.role.title()}: {turn.content}" for turn in input_turns)
-        if not input_text:
+        system_text = (
+            "\n".join(system_turns)
+            if system_turns
+            else optional_string(raw_record.get("system"), "system")
+        )
+        if not input_text and system_text is None:
             raise DatasetValidationError("field 'conversations' must contain context before the assistant response")
         return DatasetRecord(
             read_identifier(raw_record, fallback_identifier, required=False),
@@ -127,6 +142,7 @@ class ShareGptRecordAdapter:
             optional_string(raw_record.get("thinking"), "thinking"),
             output_text,
             read_metadata(raw_record),
+            system_text,
         )
 
     def read_turn(self, raw_turn: Any, index: int) -> ConversationTurn:
@@ -134,7 +150,13 @@ class ShareGptRecordAdapter:
             raise DatasetValidationError(f"conversation turn {index} must be an object")
         raw_role = raw_turn.get("role", raw_turn.get("from"))
         raw_content = raw_turn.get("content", raw_turn.get("value"))
-        role_aliases = {"human": "user", "user": "user", "gpt": "assistant", "assistant": "assistant"}
+        role_aliases = {
+            "human": "user",
+            "user": "user",
+            "gpt": "assistant",
+            "assistant": "assistant",
+            "system": "system",
+        }
         if not isinstance(raw_role, str) or raw_role not in role_aliases:
             raise DatasetValidationError(f"conversation turn {index} has an unsupported role")
         return ConversationTurn(role_aliases[raw_role], require_string(raw_content, f"conversations[{index}] content"))

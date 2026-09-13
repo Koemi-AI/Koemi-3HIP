@@ -72,6 +72,7 @@ class CliCommandTests(unittest.TestCase):
                         "FIFO",
                         "--max-new-bytes",
                         "4",
+                        "--raw-prompt",
                     ]
                 )
             self.assertEqual(0, generate_status)
@@ -108,3 +109,95 @@ class CliCommandTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(0, status)
+
+    def test_generate_wraps_the_prompt_in_the_training_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            dataset_path = workspace / "dataset.jsonl"
+            dataset_path.write_text(
+                json.dumps(dict(CANONICAL_RECORD, system="Answer briefly.")) + "\n",
+                encoding="utf-8",
+            )
+            checkpoint_path = workspace / "model.pt"
+            train_status = main(
+                [
+                    "train",
+                    "--dataset",
+                    str(dataset_path),
+                    "--checkpoint",
+                    str(checkpoint_path),
+                    "--epochs",
+                    "1",
+                    "--embedding-size",
+                    "16",
+                    "--memory-features",
+                    "4",
+                    "--local-memory-size",
+                    "4",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            self.assertEqual(0, train_status)
+            output = io.BytesIO()
+            stdout = type("BufferedStdout", (), {"buffer": output})()
+            with patch("koemi.cli.sys.stdout", stdout):
+                generate_status = main(
+                    [
+                        "generate",
+                        "--checkpoint",
+                        str(checkpoint_path),
+                        "--system",
+                        "Answer briefly.",
+                        "--prompt",
+                        "Explain FIFO.",
+                        "--max-new-bytes",
+                        "4",
+                    ]
+                )
+            self.assertEqual(0, generate_status)
+            written = output.getvalue()
+            self.assertNotIn(b"<|system|>", written)
+            self.assertNotIn(b"<|input|>", written)
+            self.assertNotIn(b"Explain FIFO.", written)
+
+    def test_generate_refuses_a_system_prompt_with_a_raw_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            dataset_path = workspace / "dataset.jsonl"
+            dataset_path.write_text(json.dumps(CANONICAL_RECORD) + "\n", encoding="utf-8")
+            checkpoint_path = workspace / "model.pt"
+            main(
+                [
+                    "train",
+                    "--dataset",
+                    str(dataset_path),
+                    "--checkpoint",
+                    str(checkpoint_path),
+                    "--epochs",
+                    "1",
+                    "--embedding-size",
+                    "16",
+                    "--memory-features",
+                    "4",
+                    "--local-memory-size",
+                    "4",
+                    "--device",
+                    "cpu",
+                ]
+            )
+            status = main(
+                [
+                    "generate",
+                    "--checkpoint",
+                    str(checkpoint_path),
+                    "--prompt",
+                    "FIFO",
+                    "--system",
+                    "Answer briefly.",
+                    "--raw-prompt",
+                    "--max-new-bytes",
+                    "2",
+                ]
+            )
+            self.assertEqual(2, status)
