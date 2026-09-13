@@ -151,6 +151,67 @@ previous byte and absolute position selects one expert. There is no risk head,
 top-k selector, routing projection or routing loss. This partitions contexts
 more finely than byte-only dispatch, but it is not learned semantic routing.
 
+## Parameter offload
+
+Offload moves parameters off the compute device by how much arithmetic their
+residency actually buys. The ranking is measured, not declared: one calibration
+forward records how many token-rows reach each module, `FLOPs / parameter byte`
+follows from the module type and those rows, and the budget is filled from the
+top down.
+
+That metric puts the parts in the order you would expect and for a stated reason.
+The byte predictor is reached twice per forward, once for the logits and once for
+the surprise preview, so it ranks first. The memory and fusion projections see
+every token, so they come next. An expert sees only the tokens its dispatch sent
+it, so a wider bank ranks lower per expert. The embedding table performs a gather
+and no arithmetic at all, so it ranks last: keeping it resident buys no compute.
+
+Three tiers, in fill order:
+
+| Tier | Where the parameter lives | Trainable | Cost per forward |
+| --- | --- | --- | --- |
+| `accelerator` | compute device | yes | none |
+| `host` | host memory, copied per forward | yes | one host-to-device copy |
+| `disk` | storage, read per forward | no, must be frozen | one file read |
+
+```bash
+.venv/bin/python -m koemi train \
+  --dataset examples/canonical.jsonl \
+  --checkpoint artifacts/koemi.pt \
+  --offload-accelerator-mib 512 \
+  --offload-host-mib 2048 \
+  --overwrite
+
+.venv/bin/python -m koemi generate \
+  --checkpoint artifacts/koemi.pt \
+  --prompt "FIFO means" \
+  --offload-accelerator-mib 0 \
+  --offload-host-mib 0 \
+  --offload-store artifacts/offload-weights
+```
+
+The host tier keeps the parameter as the autograd leaf. A hook running immediately
+before the module's forward lends it a copy on the compute device and takes the
+copy back afterwards, so the gradient lands on the host leaf and the optimizer
+needs no change. Logits and gradients are bit-exact against a fully resident
+model, and a test asserts it with `torch.equal`. On a host with no accelerator the
+copy is the identity, so the mechanism runs but the transfer it exists for cannot
+be measured here.
+
+The disk tier refuses a parameter that still requires a gradient, with the module
+and parameter named in the error. That restriction is the honest one: a weight the
+optimizer updates cannot be thrown away after every forward. It also describes the
+case it is built for, a finetune over a frozen base, and inference.
+
+Disk offload buys memory with time, and the log says how much. Generating six
+bytes from a 211,888-byte model with every module on the disk tier performed 329
+materializations, read 1,311,532 bytes and spent 1.39 s inside those reads. That
+is 6.2 times the parameter footprint read back from storage. Use the disk tier
+when the model does not fit, not to make it faster.
+
+Every run logs `offload_plan` with the bytes and module count per tier and the
+materialization counters, so a plan can be checked against the machine it ran on.
+
 ## Configuration
 
 | Option | Default | Effect |
@@ -162,6 +223,9 @@ more finely than byte-only dispatch, but it is not learned semantic routing.
 | `--cache-capacity` | `256` | Maximum RAM token embeddings. |
 | `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
 | `--refine-decay-rate` | `0.0625` | Slow-memory timescale relative to fast decay. |
+| `--offload-accelerator-mib` | unlimited | Parameter budget kept on the compute device. |
+| `--offload-host-mib` | unlimited | Parameter budget streamed from host memory. |
+| `--offload-store` | none | Directory for parameters evicted to storage. |
 | `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
 | `--gradient-accumulation-steps` | `1` | Microbatches per optimizer update. |
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
@@ -189,6 +253,9 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 - Contextual deterministic experts are not learned semantic routing. Learned
   expert selection would reintroduce a router, contrary to this architecture.
+- The offload store writes parameter files outside the checkpoint. Point
+  `--offload-store` at a private directory: the files are plain weights and no
+  namespace or expiry protects them.
 - The disk cache reuses exact hashed sequences only; “similar question” reuse
   needs retrieval and a similarity contract outside this phase.
 - Disk entries contain recurrent state and logits and can encode prompt content.
@@ -213,6 +280,7 @@ src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization and tokenizer
   model/          HERM state, memory, cache, scan and deterministic MoE
+  runtime/        parameter offload: traffic calibration, tiers, disk store
   training/       Causal chunks, objective, trainer, checkpoint and generation
 benchmarks/       OBOV against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts

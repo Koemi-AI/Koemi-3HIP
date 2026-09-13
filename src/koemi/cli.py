@@ -15,6 +15,14 @@ from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
 from koemi.observability.logging import configure_logging
+from koemi.runtime.offload import (
+    ACCELERATOR_TIER,
+    DISK_TIER,
+    HOST_TIER,
+    OffloadEngine,
+    OffloadRequest,
+    prepare_offload,
+)
 from koemi.training.checkpoints import CheckpointStore
 from koemi.training.dataset import CausalByteDataset, create_training_loader
 from koemi.training.generation import generate_text
@@ -69,6 +77,7 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num-workers", type=int, default=0)
     train_parser.add_argument("--prefetch-factor", type=int, default=2)
     train_parser.add_argument("--no-pin-memory", action="store_true")
+    add_offload_arguments(train_parser)
     add_model_arguments(train_parser)
 
     generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-2OBOV checkpoint")
@@ -84,12 +93,70 @@ def create_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--mapping-cache-namespace", default=None)
     generate_parser.add_argument("--mapping-cache-ttl-seconds", type=float, default=3600.0)
     generate_parser.add_argument("--clear-mapping-cache", action="store_true")
+    add_offload_arguments(generate_parser)
     return parser
 
 
 def add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", action="append", required=True, help="JSON, JSONL or TXT dataset path")
     parser.add_argument("--dataset-format", choices=SUPPORTED_DATASET_FORMATS, default="auto")
+
+
+def add_offload_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--offload-accelerator-mib",
+        type=int,
+        default=None,
+        help="Parameter budget kept on the compute device, in MiB",
+    )
+    parser.add_argument(
+        "--offload-host-mib",
+        type=int,
+        default=None,
+        help="Parameter budget streamed from host memory, in MiB",
+    )
+    parser.add_argument(
+        "--offload-store",
+        default=None,
+        help="Directory holding parameters evicted to storage",
+    )
+
+
+def offload_request(arguments: argparse.Namespace) -> OffloadRequest:
+    return OffloadRequest(
+        accelerator_bytes=mebibytes_to_bytes(arguments.offload_accelerator_mib),
+        host_bytes=mebibytes_to_bytes(arguments.offload_host_mib),
+        store_directory=arguments.offload_store,
+    )
+
+
+def mebibytes_to_bytes(value: int | None) -> int | None:
+    if value is None:
+        return None
+    if value < 0:
+        raise ValueError("an offload budget must be non-negative")
+    return value * 1024 * 1024
+
+
+def log_offload(engine: OffloadEngine, logger) -> None:
+    statistics = engine.refresh_statistics()
+    logger.info(
+        "offload_plan accelerator_bytes=%s host_bytes=%s disk_bytes=%s "
+        "accelerator_modules=%s host_modules=%s disk_modules=%s "
+        "host_materializations=%s host_transferred_bytes=%s "
+        "disk_materializations=%s disk_read_bytes=%s disk_read_seconds=%.4f",
+        statistics.bytes_by_tier[ACCELERATOR_TIER],
+        statistics.bytes_by_tier[HOST_TIER],
+        statistics.bytes_by_tier[DISK_TIER],
+        len(engine.plan.names_by_tier(ACCELERATOR_TIER)),
+        len(engine.plan.names_by_tier(HOST_TIER)),
+        len(engine.plan.names_by_tier(DISK_TIER)),
+        statistics.host_materializations,
+        statistics.host_transferred_bytes,
+        statistics.disk_materializations,
+        statistics.disk_read_bytes,
+        statistics.disk_read_seconds,
+    )
 
 
 def add_model_arguments(parser: argparse.ArgumentParser) -> None:
@@ -160,7 +227,13 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
             prefetch_factor=training_settings.prefetch_factor,
         )
     model = KoemiModel(model_settings)
-    result = Trainer(logger).train(model, loader, training_settings, validation_loader)
+    engine = attach_offload(model, loader, training_settings.device, arguments, logger)
+    try:
+        result = Trainer(logger).train(model, loader, training_settings, validation_loader)
+    finally:
+        if engine is not None:
+            log_offload(engine, logger)
+            engine.detach()
     checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
     logger.info(
         "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f thinking_loss=%.6f "
@@ -186,6 +259,52 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
     return 0
 
 
+def attach_offload(
+    model: KoemiModel,
+    loader,
+    device: str,
+    arguments: argparse.Namespace,
+    logger,
+) -> OffloadEngine | None:
+    request = offload_request(arguments)
+    if not request.requested:
+        return None
+    sample = loader.collate_fn([loader.dataset[0]])
+    input_ids = sample["input_ids"].to(device)
+
+    def calibration_forward() -> None:
+        with torch.no_grad():
+            model(input_ids)
+
+    model.to(device)
+    engine = prepare_offload(model, calibration_forward, request, device)
+    log_offload(engine, logger)
+    return engine
+
+
+def attach_inference_offload(
+    model: KoemiModel,
+    tokenizer: ByteTokenizer,
+    prompt: str,
+    arguments: argparse.Namespace,
+    logger,
+) -> OffloadEngine | None:
+    request = offload_request(arguments)
+    if not request.requested:
+        return None
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    prompt_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=arguments.device)
+
+    def calibration_forward() -> None:
+        with torch.no_grad():
+            model(prompt_ids)
+
+    engine = prepare_offload(model, calibration_forward, request, arguments.device)
+    log_offload(engine, logger)
+    return engine
+
+
 def generate_completion(arguments: argparse.Namespace, logger) -> int:
     loaded_checkpoint = CheckpointStore().load(arguments.checkpoint, arguments.device)
     cache_capacity = arguments.cache_capacity or loaded_checkpoint.model_settings.cache_capacity
@@ -205,16 +324,25 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     )
     if mapping_cache is not None and arguments.clear_mapping_cache:
         logger.info("mapping_cache_cleared entries=%s", mapping_cache.clear())
-    completion = generate_text(
-        loaded_checkpoint.model,
-        ByteTokenizer(),
-        arguments.prompt,
-        arguments.max_new_bytes,
-        arguments.temperature,
-        arguments.device,
-        warm_cache,
-        mapping_cache,
+    tokenizer = ByteTokenizer()
+    engine = attach_inference_offload(
+        loaded_checkpoint.model, tokenizer, arguments.prompt, arguments, logger
     )
+    try:
+        completion = generate_text(
+            loaded_checkpoint.model,
+            tokenizer,
+            arguments.prompt,
+            arguments.max_new_bytes,
+            arguments.temperature,
+            arguments.device,
+            warm_cache,
+            mapping_cache,
+        )
+    finally:
+        if engine is not None:
+            log_offload(engine, logger)
+            engine.detach()
     statistics = warm_cache.statistics()
     mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
     logger.info(
