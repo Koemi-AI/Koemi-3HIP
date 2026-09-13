@@ -166,9 +166,10 @@ def koemi_state_bytes(settings: ModelSettings) -> int:
     associative_scalars = embedding_size * settings.memory_features + settings.memory_features
     state_scalars = embedding_size + 2 * associative_scalars
     local_bytes = 2 * settings.local_memory_size * embedding_size * 4
-    valid_bytes = settings.local_memory_size
+    salient_bytes = 2 * settings.salience_memory_size * embedding_size * 4
+    valid_bytes = settings.local_memory_size + settings.salience_memory_size
     last_token_bytes = 8
-    return state_scalars * 4 + local_bytes + valid_bytes + last_token_bytes
+    return state_scalars * 4 + local_bytes + salient_bytes + valid_bytes + last_token_bytes
 
 
 def evaluation_error(values: list[float]) -> float:
@@ -272,6 +273,8 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         embedding_size=arguments.embedding_size,
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
+        salience_memory_size=arguments.salience_memory_size,
+        salience_threshold=arguments.salience_threshold,
         expert_count=arguments.expert_count,
         ablation=arguments.ablation,
     )
@@ -363,8 +366,10 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--embedding-size", type=int, default=48)
     parser.add_argument("--memory-features", type=int, default=12)
     parser.add_argument("--local-memory-size", type=int, default=12)
+    parser.add_argument("--salience-memory-size", type=int, default=12)
+    parser.add_argument("--salience-threshold", type=float, default=0.75)
     parser.add_argument("--expert-count", type=int, default=0)
-    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="herm")
+    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="no_refine")
     parser.add_argument("--report", default=None)
     return parser
 

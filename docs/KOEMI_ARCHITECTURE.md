@@ -40,13 +40,15 @@ flowchart LR
     R --> SLOW[Slow refine state]
     S --> M
     H --> L[Exact local KV ring]
+    H --> A[Exact salient KV ring]
     H --> Fuse[Linear fusion]
     M --> Fuse
     SLOW --> Fuse
     L --> Fuse
-    Fuse --> E[Optional fixed expert e = token mod E]
+    A --> Fuse
+    Fuse --> E[Optional expert by mixed bigram hash]
     E --> Head[Byte logits]
-    Disk[Optional SSD mapping cache] -. exact hash hit .-> Head
+    Disk[Optional SSD prefix ledger] -. longest exact prefix .-> H
 ```
 
 ## Mathematical specification
@@ -90,13 +92,22 @@ The read uses the previous state, which keeps the update causal:
 ```text
 q_t = W_q h_t
 psi_t = softmax(W_phi q_t + b_phi)
-m_t = B_(t-1) psi_t / (c_(t-1) dot psi_t + eps_m)
+den_t = c_(t-1) dot psi_t
+raw_t = B_(t-1) psi_t / (den_t + eps_m)
+confidence_t = den_t / (den_t + eps_m)
+m_t = confidence_t * raw_t
 ```
 
-The denominator is scalar after feature contraction, avoiding a full covariance
-or matrix inverse. The slow tier writes a bounded residual
+The confidence gate makes zero evidence produce zero even if a loaded or corrupt
+basis is inconsistent with its normalizer. The denominator is scalar after
+feature contraction, avoiding a full covariance or matrix inverse. The slow tier writes a bounded residual
 `r_t = v_t - m_t` with longer retention and a surprise/novelty weight. Both
 tiers are affine scans.
+
+The parallel evaluator keeps each update as `(w_t, v_t, phi_t)` and computes
+within-chunk write/query influence through a causal `[B,C,C]` contraction. It
+returns the reads and final matrix only. The old `[B,L,d,m]` sequence of basis
+increments and states is absent from the runtime path.
 
 ### 3. Surprise-controlled writing
 
@@ -126,18 +137,32 @@ The oldest pair is discarded after the current token is processed. Cost is
 `O(Wd)` per token and state storage is bounded by `O(Wd)`. Padding entries are
 never considered valid pairs.
 
-### 5. Fusion and fixed-dispatch MoE
+### 5. Exact salient retrieval
 
-The three states are concatenated into one typed context:
+A second bounded ring uses the same projected key/value entries. Admission is
+causal and independent for each token:
 
 ```text
-z_t = RMSNorm(W_z [h_t || m_t || l_t] + b_z)
+keep_t = valid_t and surprise_t > tau
+```
+
+The ring retains the last `S` admitted entries at any distance. A parallel query
+sees carried entries and admitted positions strictly before itself; future
+admissions cannot change an earlier output. `S=16` and `tau=0.75` are experiment
+defaults, not demonstrated quality optima.
+
+### 6. Fusion and fixed-dispatch MoE
+
+The four states are concatenated into one typed context:
+
+```text
+z_t = RMSNorm(W_z [h_t || m_t || l_t || a_t] + b_z)
 ```
 
 When `expert_count = E > 0`, dispatch is fixed and deterministic:
 
 ```text
-e_t = hash(token_id_t, token_id_(t-1), position_t) mod E
+e_t = mix_hash(token_id_t, token_id_(t-1)) mod E
 y_t = RMSNorm(z_t + FFN_e_t(z_t))
 ```
 
@@ -146,7 +171,11 @@ risk head, top-k selector, soft mixture or routing loss. This is a deliberate
 trade-off: KSM has a predictable sparse expert bank, not learned semantic MoE
 dispatch. `expert_count = 0` skips the bank entirely.
 
-### 6. Causal prediction
+Absolute position is excluded so a repeated bigram has a stable expert. The
+mixing finalizer prevents power-of-two expert counts from reading only the low
+bits of an affine byte combination.
+
+### 7. Causal prediction
 
 ```text
 logits_t = W_vocab y_t + b_vocab
@@ -177,14 +206,15 @@ KSM has explicit cache tiers:
 | --- | --- | --- | --- |
 | L0 | GPU/CPU tensors | carried `KoemiState` | caller passes state within one session |
 | L1 | RAM or device memory | detached token embeddings | token id and matching device/dtype |
-| L2 | opt-in SSD directory | logits and final state | exact hashed input sequence |
+| L2 | opt-in SSD directory | final logits and bounded state | longest byte-identical prefix |
 
 The L1 `WarmTokenCache` avoids repeated embedding lookups. It is disabled during
 training because detached embeddings would become stale after optimizer steps.
 
-The L2 `DiskMappingCache` stores tensor-only payloads with a format version,
-checkpoint namespace, hash-derived filename, bounded entry count, weights-only
-loading and atomic writes. A cache hit skips the exact sequence forward pass. It does not infer
+The L2 `DiskMappingCache` stores tensor-only prefix snapshots with a format
+version, checkpoint namespace, rolling BLAKE2 filename, bounded entry count,
+weights-only loading and atomic writes. Prompt evaluation resumes from the
+longest hit and computes only the suffix. It does not infer
 that a semantically similar question has the same answer. That requires a
 retrieval index and a validation policy.
 
@@ -200,8 +230,9 @@ only uses disk for exact mappings whose read can replace a complete computation.
 ## Execution and training
 
 The parallel path partitions long sequences into `scan_chunk` windows. Inside a
-window it uses affine scans for the recurrent state and associative state. The
-sequential path performs the same equations one token at a time. Tests compare
+window it uses an affine scan for recurrent state and a causal dense contraction
+for associative reads and the final state. The sequential path performs the same
+equations one token at a time. Tests compare
 logits, state tensors and selected gradients before any GPU kernel optimization.
 
 This is tensor-level parallelism, not an `asyncio` scheduler. Causal state
@@ -223,12 +254,12 @@ must be measured by the OBOV benchmark.
 | Affine parallel scan | `model/scan.py` | implemented and compared |
 | Hierarchical fast/slow associative memory | `model/memory.py` | implemented |
 | Surprise write scaling | `model/network.py` | implemented |
-| Exact local ring with validity | `model/memory.py` | implemented |
+| Exact local and salient rings with validity | `model/memory.py` | implemented |
 | Fixed-dispatch MoE | `model/experts.py` | implemented |
 | Thinking mask and weighted loss | `training/dataset.py`, `training/objective.py` | implemented |
 | RAM warm embedding cache | `model/cache.py` | implemented |
-| Optional SSD exact mapping cache | `model/cache.py` | implemented |
-| Persistent episodic memory | none | out of scope |
+| Optional SSD exact prefix ledger | `model/cache.py`, `training/generation.py` | implemented |
+| Semantic episodic memory | none | out of scope |
 | Learned semantic retrieval | none | out of scope |
 | Distributed/GPU kernel path | none | pending |
 

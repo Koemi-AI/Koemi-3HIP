@@ -103,6 +103,37 @@ standard error, training/evaluation throughput, peak resident memory, state
 bytes and fixed expert activations. It
 does not report route fraction or router accuracy because OBOV has neither.
 
+## Rank-one chunk and prefix-ledger probe
+
+Measured on 2026-09-13 on the same CPU-only Windows host, FP32, four threads,
+batch 4 x 256, `d=64`, seven timed forwards after two warmups. These numbers
+describe the rank-one chunk implementation, not training quality.
+
+| Configuration | Median tokens/s | Versus new default |
+| --- | ---: | ---: |
+| no_refine, m=16, local=16, chunk=128 | 18,196 | 1.00x |
+| herm refine | 15,850 | 0.87x |
+| memory_features=4 | 17,726 | 0.97x |
+| memory_features=64 | 15,328 | 0.84x |
+| local_window=4 | 19,913 | 1.09x |
+| local_window=128 | 9,829 | 0.54x |
+
+The old scan materialized `[B,L,d,m]`; the diagnostic supplied immediately
+before this change measured 3,875 tokens/s at the same shape. The new default is
+4.70x that historical measurement, but it is not a paired checkout benchmark.
+More importantly, changing `memory_features` from 4 to 64 now reduces throughput
+by 13.5%, rather than dominating it. The runtime path keeps rank-one factors and
+uses `[B,C,C]` write/query influence.
+
+The new evaluator changed the chunk optimum. A separate seven-run sweep measured
+5,576, 9,267, 14,568, 18,150 and 13,626 tokens/s for chunks 16, 32, 64, 128 and
+256. The old result favoring 32 no longer applies; 128 remains the CPU default.
+
+Prefix reuse used a 1,024-token cached prefix plus a 16-token unique suffix. Five
+requests each processed 16 tokens, reused 1,024 and matched a full 1,040-token
+forward with maximum logit error 0. Cached median latency was 2.39x lower than
+the full forward, including the SSD lookup and state load.
+
 ## Required comparison protocol
 
 Use the same tokenizer, corpus slice, optimizer, token budget, precision,

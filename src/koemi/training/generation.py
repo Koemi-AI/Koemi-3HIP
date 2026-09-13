@@ -1,12 +1,70 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
+from torch import Tensor
 
 from koemi.configuration.settings import PAD_TOKEN_ID
 from koemi.data.tokenizer import ByteTokenizer
-from koemi.model.cache import DiskMappingCache, WarmTokenCache
+from koemi.model.cache import CachedPrefixState, DiskMappingCache, WarmTokenCache
 from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
+from koemi.model.state import KoemiState
+
+
+@dataclass(frozen=True)
+class PromptEvaluation:
+    last_logits: Tensor
+    state: KoemiState
+    processed_tokens: int
+    reused_prefix_tokens: int
+
+
+def evaluate_prompt_state(
+    model: KoemiModel,
+    input_ids: Tensor,
+    warm_cache: WarmTokenCache | None,
+    prefix_cache: DiskMappingCache | None,
+) -> PromptEvaluation:
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:
+        raise ValueError("prompt evaluation requires input_ids with shape [1, sequence]")
+    cached_prefix = (
+        prefix_cache.get_longest_prefix(input_ids, input_ids.device)
+        if prefix_cache is not None
+        else None
+    )
+    if cached_prefix is None:
+        prefix_length = 0
+        current_state = None
+    else:
+        prefix_length, cached_state = cached_prefix
+        current_state = cached_state.state
+        if prefix_length == input_ids.shape[1]:
+            return PromptEvaluation(cached_state.last_logits, current_state, 0, prefix_length)
+
+    processed_tokens = 0
+    last_logits = None
+    chunk_size = model.settings.scan_chunk
+    for end in range(prefix_length + chunk_size, input_ids.shape[1], chunk_size):
+        output = model(input_ids[:, prefix_length:end], current_state, warm_cache=warm_cache)
+        processed_tokens += end - prefix_length
+        prefix_length = end
+        current_state = output.state
+        last_logits = output.logits[:, -1]
+        if prefix_cache is not None:
+            prefix_cache.put_prefix(input_ids[:, :end], CachedPrefixState(last_logits, current_state))
+    if prefix_length < input_ids.shape[1]:
+        output = model(input_ids[:, prefix_length:], current_state, warm_cache=warm_cache)
+        processed_tokens += input_ids.shape[1] - prefix_length
+        prefix_length = input_ids.shape[1]
+        current_state = output.state
+        last_logits = output.logits[:, -1]
+        if prefix_cache is not None:
+            prefix_cache.put_prefix(input_ids, CachedPrefixState(last_logits, current_state))
+    if last_logits is None or current_state is None:
+        raise RuntimeError("prompt evaluation did not produce model state")
+    return PromptEvaluation(last_logits, current_state, processed_tokens, prefix_length - processed_tokens)
 
 
 def generate_text(
@@ -30,14 +88,10 @@ def generate_text(
     model.eval()
     generated_ids = list(prompt_ids)
     with torch.no_grad():
-        output = model(
-            input_ids,
-            execution_mode=ExecutionMode.PARALLEL,
-            warm_cache=warm_cache,
-            mapping_cache=mapping_cache,
-        )
+        prompt_evaluation = evaluate_prompt_state(model, input_ids, warm_cache, mapping_cache)
+        next_logits = prompt_evaluation.last_logits.clone()
+        current_state = prompt_evaluation.state
         for _ in range(max_new_bytes):
-            next_logits = output.logits[:, -1, :].clone()
             next_logits[:, PAD_TOKEN_ID] = float("-inf")
             probabilities = torch.softmax(next_logits / temperature, dim=-1)
             next_token = torch.multinomial(probabilities, num_samples=1)
@@ -45,9 +99,10 @@ def generate_text(
             generated_ids.append(next_token_id)
             output = model(
                 next_token,
-                output.state,
+                current_state,
                 execution_mode=ExecutionMode.PARALLEL,
                 warm_cache=warm_cache,
-                mapping_cache=mapping_cache,
             )
+            next_logits = output.logits[:, -1, :].clone()
+            current_state = output.state
     return tokenizer.decode(generated_ids)

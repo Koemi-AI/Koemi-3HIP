@@ -55,8 +55,10 @@ class KoemiModel(nn.Module):
             settings.refine_decay_rate,
         )
         self.local_memory = LocalKeyValueMemory(embedding_size, settings.local_memory_size)
-        self.memory_refine_gate = nn.Linear(embedding_size * 4, 1)
-        self.fusion_projection = nn.Linear(embedding_size * 3, embedding_size)
+        self.memory_refine_gate = (
+            None if settings.ablation == "no_refine" else nn.Linear(embedding_size * 4, 1)
+        )
+        self.fusion_projection = nn.Linear(embedding_size * 4, embedding_size)
         self.fusion_normalizer = RootMeanSquareNorm(embedding_size)
         self.experts = DeterministicExpertMixture(embedding_size, settings.expert_count)
         self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size)
@@ -157,22 +159,27 @@ class KoemiModel(nn.Module):
             self.associative_memory.fast_write_terms(projection, surprise),
             valid_mask,
         )
-        basis_states = affine_scan(fast_terms.decay.unsqueeze(-1), fast_terms.basis_increment, current_state.memory_basis)
-        normalizer_states = affine_scan(
-            fast_terms.decay,
-            fast_terms.normalizer_increment,
+        fast_memory, next_basis, next_normalizer = self.associative_memory.scan_and_read(
+            current_state.memory_basis,
             current_state.memory_normalizer,
+            fast_terms,
+            working_states,
         )
-        fast_memory, _ = self.associative_memory.read(
-            previous_states(basis_states, current_state.memory_basis),
-            previous_states(normalizer_states, current_state.memory_normalizer),
+        salience_admission = valid_mask & (surprise > self.settings.salience_threshold)
+        salient_value = self.local_memory.read_salient_window(
+            current_state.salient_keys,
+            current_state.salient_values,
+            current_state.salient_valid,
+            local_keys,
+            local_values,
+            salience_admission,
             working_states,
         )
 
         reconstruction_error = projection.value - fast_memory
         if self.settings.ablation == "no_refine":
-            refine_basis_states = current_state.refine_basis.unsqueeze(1).expand(-1, length, -1, -1)
-            refine_normalizer_states = current_state.refine_normalizer.unsqueeze(1).expand(-1, length, -1)
+            next_refine_basis = current_state.refine_basis
+            next_refine_normalizer = current_state.refine_normalizer
             refine_memory = torch.zeros_like(fast_memory)
         else:
             refine_terms = self.mask_write_terms(
@@ -184,19 +191,10 @@ class KoemiModel(nn.Module):
                 ),
                 valid_mask,
             )
-            refine_basis_states = affine_scan(
-                refine_terms.decay.unsqueeze(-1),
-                refine_terms.basis_increment,
+            refine_memory, next_refine_basis, next_refine_normalizer = self.associative_memory.scan_and_read(
                 current_state.refine_basis,
-            )
-            refine_normalizer_states = affine_scan(
-                refine_terms.decay,
-                refine_terms.normalizer_increment,
                 current_state.refine_normalizer,
-            )
-            refine_memory, _ = self.associative_memory.read(
-                previous_states(refine_basis_states, current_state.refine_basis),
-                previous_states(refine_normalizer_states, current_state.refine_normalizer),
+                refine_terms,
                 working_states,
             )
 
@@ -205,7 +203,7 @@ class KoemiModel(nn.Module):
             if self.settings.ablation == "no_refine"
             else self.refine_memory(working_states, fast_memory, refine_memory, local_value)
         )
-        fused_context = self.fuse(working_states, memory_value, local_value)
+        fused_context = self.fuse(working_states, memory_value, local_value, salient_value)
         previous_token_ids = self.previous_token_ids(input_ids, valid_mask, current_state.last_token_ids)
         final_context, expert_indices = self.experts(
             fused_context,
@@ -222,15 +220,27 @@ class KoemiModel(nn.Module):
             local_values,
             local_valid,
         )
+        next_salient_keys, next_salient_values, next_salient_valid = self.local_memory.salient_tail(
+            current_state.salient_keys,
+            current_state.salient_values,
+            current_state.salient_valid,
+            local_keys,
+            local_values,
+            salience_admission,
+            self.settings.salience_memory_size,
+        )
         next_state = KoemiState(
             working_state=working_states[:, -1],
-            memory_basis=basis_states[:, -1],
-            memory_normalizer=normalizer_states[:, -1],
-            refine_basis=refine_basis_states[:, -1],
-            refine_normalizer=refine_normalizer_states[:, -1],
+            memory_basis=next_basis,
+            memory_normalizer=next_normalizer,
+            refine_basis=next_refine_basis,
+            refine_normalizer=next_refine_normalizer,
             local_keys=next_local_keys,
             local_values=next_local_values,
             local_valid=next_local_valid,
+            salient_keys=next_salient_keys,
+            salient_values=next_salient_values,
+            salient_valid=next_salient_valid,
             last_token_ids=self.last_valid_token_ids(input_ids, valid_mask, current_state.last_token_ids),
             step_index=current_state.step_index + length,
         )
@@ -264,6 +274,9 @@ class KoemiModel(nn.Module):
             local_keys=current_state.local_keys,
             local_values=current_state.local_values,
             local_valid=current_state.local_valid,
+            salient_keys=current_state.salient_keys,
+            salient_values=current_state.salient_values,
+            salient_valid=current_state.salient_valid,
             last_token_ids=self.last_valid_token_ids(input_ids, valid_mask, current_state.last_token_ids),
             step_index=current_state.step_index + input_ids.shape[1],
         )
@@ -327,6 +340,9 @@ class KoemiModel(nn.Module):
                     local_keys=current_state.local_keys,
                     local_values=current_state.local_values,
                     local_valid=current_state.local_valid,
+                    salient_keys=current_state.salient_keys,
+                    salient_values=current_state.salient_values,
+                    salient_valid=current_state.salient_valid,
                     last_token_ids=torch.where(valid_mask, token_ids, current_state.last_token_ids),
                     step_index=current_state.step_index + 1,
                 )
@@ -335,6 +351,12 @@ class KoemiModel(nn.Module):
                 current_state.local_keys,
                 current_state.local_values,
                 current_state.local_valid,
+                working_state,
+            )
+            salient_value, _ = self.local_memory.read(
+                current_state.salient_keys,
+                current_state.salient_values,
+                current_state.salient_valid,
                 working_state,
             )
             projection = self.associative_memory.project(working_state)
@@ -356,7 +378,7 @@ class KoemiModel(nn.Module):
                 if self.settings.ablation == "no_refine"
                 else self.refine_memory(working_state, fast_memory, refine_memory, local_value)
             )
-            fused_context = self.fuse(working_state, memory_value, local_value)
+            fused_context = self.fuse(working_state, memory_value, local_value, salient_value)
             final_context, expert_indices = self.experts(
                 fused_context.unsqueeze(1),
                 token_ids.unsqueeze(1),
@@ -400,6 +422,16 @@ class KoemiModel(nn.Module):
                 written_value,
                 written_valid,
             )
+            salience_admission = valid_mask & (surprise > self.settings.salience_threshold)
+            next_salient_keys, next_salient_values, next_salient_valid = self.local_memory.salient_tail(
+                current_state.salient_keys,
+                current_state.salient_values,
+                current_state.salient_valid,
+                written_key.unsqueeze(1),
+                written_value.unsqueeze(1),
+                salience_admission.unsqueeze(1),
+                self.settings.salience_memory_size,
+            )
             current_state = KoemiState(
                 working_state=working_state,
                 memory_basis=torch.where(
@@ -425,6 +457,9 @@ class KoemiModel(nn.Module):
                 local_keys=next_local_keys,
                 local_values=next_local_values,
                 local_valid=next_local_valid,
+                salient_keys=next_salient_keys,
+                salient_values=next_salient_values,
+                salient_valid=next_salient_valid,
                 last_token_ids=torch.where(valid_mask, token_ids, current_state.last_token_ids),
                 step_index=current_state.step_index + 1,
             )
@@ -470,29 +505,30 @@ class KoemiModel(nn.Module):
         refine_memory: Tensor,
         local_value: Tensor,
     ) -> Tensor:
+        if self.memory_refine_gate is None:
+            raise RuntimeError("refine memory is disabled by the model settings")
         refine_gate = torch.sigmoid(
             self.memory_refine_gate(torch.cat((working_state, fast_memory, refine_memory, local_value), dim=-1))
         )
         return fast_memory + refine_gate * refine_memory
 
-    def fuse(self, working_state: Tensor, memory_value: Tensor, local_value: Tensor) -> Tensor:
+    def fuse(
+        self,
+        working_state: Tensor,
+        memory_value: Tensor,
+        local_value: Tensor,
+        salient_value: Tensor,
+    ) -> Tensor:
         return self.fusion_normalizer(
-            self.fusion_projection(torch.cat((working_state, memory_value, local_value), dim=-1))
+            self.fusion_projection(torch.cat((working_state, memory_value, local_value, salient_value), dim=-1))
         )
 
     def mask_write_terms(self, terms: MemoryWriteTerms, valid_mask: Tensor) -> MemoryWriteTerms:
         return MemoryWriteTerms(
             decay=torch.where(valid_mask.unsqueeze(-1), terms.decay, torch.ones_like(terms.decay)),
-            basis_increment=torch.where(
-                valid_mask.unsqueeze(-1).unsqueeze(-1),
-                terms.basis_increment,
-                torch.zeros_like(terms.basis_increment),
-            ),
-            normalizer_increment=torch.where(
-                valid_mask.unsqueeze(-1),
-                terms.normalizer_increment,
-                torch.zeros_like(terms.normalizer_increment),
-            ),
+            value=terms.value,
+            features=terms.features,
+            write_weight=torch.where(valid_mask, terms.write_weight, torch.zeros_like(terms.write_weight)),
         )
 
     def previous_token_ids(self, input_ids: Tensor, valid_mask: Tensor, carried_token_ids: Tensor) -> Tensor:
@@ -537,6 +573,9 @@ class KoemiModel(nn.Module):
             local_keys=mapping.state.local_keys.to(device),
             local_values=mapping.state.local_values.to(device),
             local_valid=mapping.state.local_valid.to(device),
+            salient_keys=mapping.state.salient_keys.to(device),
+            salient_values=mapping.state.salient_values.to(device),
+            salient_valid=mapping.state.salient_valid.to(device),
             last_token_ids=mapping.state.last_token_ids.to(device),
             step_index=mapping.state.step_index,
         )

@@ -49,7 +49,7 @@ class KoemiModelTests(unittest.TestCase):
         self.assertTrue(torch.allclose(parallel.state.memory_basis, sequential.state.memory_basis, atol=1e-5))
 
     def test_backpropagates_through_output_and_refine_memory(self) -> None:
-        model = self.build_model()
+        model = self.build_model(ablation="herm")
         input_ids = torch.tensor([[65, 66, 67]], dtype=torch.long)
         output = model(input_ids)
         output.logits.sum().backward()
@@ -70,7 +70,7 @@ class KoemiModelTests(unittest.TestCase):
         self.assertLess(float(surprise[0, 0].detach()), float(surprise[0, 1].detach()))
 
     def test_refine_memory_retains_more_slowly_than_fast_memory(self) -> None:
-        model = self.build_model()
+        model = self.build_model(ablation="herm")
         projection = model.associative_memory.project(torch.randn(2, model.settings.embedding_size))
         surprise = torch.full((2,), 0.75)
         fast_terms = model.associative_memory.fast_write_terms(projection, surprise)

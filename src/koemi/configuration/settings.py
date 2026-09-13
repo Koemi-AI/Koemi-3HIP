@@ -16,11 +16,13 @@ class ModelSettings:
     embedding_size: int = 64
     memory_features: int = 16
     local_memory_size: int = 16
+    salience_memory_size: int = 16
+    salience_threshold: float = 0.75
     expert_count: int = 0
     cache_capacity: int = 256
     scan_chunk: int = 128
     refine_decay_rate: float = 0.0625
-    ablation: str = "herm"
+    ablation: str = "no_refine"
 
     def __post_init__(self) -> None:
         if self.vocabulary_size != BYTE_VOCABULARY_SIZE + 1:
@@ -31,6 +33,10 @@ class ModelSettings:
             raise ValueError("memory_features must be at least 2")
         if self.local_memory_size < 1:
             raise ValueError("local_memory_size must be at least 1")
+        if self.salience_memory_size < 1:
+            raise ValueError("salience_memory_size must be at least 1")
+        if not 0.0 <= self.salience_threshold <= 1.0:
+            raise ValueError("salience_threshold must be between zero and one")
         if self.scan_chunk < 1:
             raise ValueError("scan_chunk must be at least 1")
         if not 0 <= self.expert_count <= 64:

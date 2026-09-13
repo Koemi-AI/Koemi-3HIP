@@ -18,6 +18,9 @@ class KoemiState:
     local_keys: Tensor
     local_values: Tensor
     local_valid: Tensor
+    salient_keys: Tensor
+    salient_values: Tensor
+    salient_valid: Tensor
     last_token_ids: Tensor
     step_index: int
 
@@ -32,6 +35,9 @@ class KoemiState:
             local_keys=torch.empty(batch_size, 0, embedding_size, device=device),
             local_values=torch.empty(batch_size, 0, embedding_size, device=device),
             local_valid=torch.empty(batch_size, 0, dtype=torch.bool, device=device),
+            salient_keys=torch.empty(batch_size, 0, embedding_size, device=device),
+            salient_values=torch.empty(batch_size, 0, embedding_size, device=device),
+            salient_valid=torch.empty(batch_size, 0, dtype=torch.bool, device=device),
             last_token_ids=torch.full((batch_size,), PAD_TOKEN_ID, dtype=torch.long, device=device),
             step_index=0,
         )

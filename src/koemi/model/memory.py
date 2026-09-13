@@ -41,8 +41,27 @@ class MemoryProjection:
 @dataclass(frozen=True)
 class MemoryWriteTerms:
     decay: Tensor
-    basis_increment: Tensor
-    normalizer_increment: Tensor
+    value: Tensor
+    features: Tensor
+    write_weight: Tensor
+
+    @property
+    def basis_increment(self) -> Tensor:
+        return self.write_weight.unsqueeze(-1).unsqueeze(-1) * (
+            self.value.unsqueeze(-1) @ self.features.unsqueeze(-2)
+        )
+
+    @property
+    def normalizer_increment(self) -> Tensor:
+        return self.write_weight.unsqueeze(-1) * self.features
+
+    def at(self, position: int) -> MemoryWriteTerms:
+        return MemoryWriteTerms(
+            self.decay[:, position],
+            self.value[:, position],
+            self.features[:, position],
+            self.write_weight[:, position],
+        )
 
 
 class HierarchicalAssociativeMemory(nn.Module):
@@ -70,11 +89,68 @@ class HierarchicalAssociativeMemory(nn.Module):
         return MemoryProjection(value, features, bounded_decay, write_weight)
 
     def read(self, memory_basis: Tensor, memory_normalizer: Tensor, query_source: Tensor) -> tuple[Tensor, Tensor]:
-        query = self.query_projection(query_source)
-        query_features = torch.softmax(self.feature_projection(query), dim=-1)
+        query_features = self.query_features(query_source)
         numerator = (memory_basis @ query_features.unsqueeze(-1)).squeeze(-1)
         denominator = (memory_normalizer * query_features).sum(dim=-1, keepdim=True)
-        return numerator / (denominator + self.epsilon), query_features
+        return self.confidence_weighted_read(numerator, denominator), query_features
+
+    def scan_and_read(
+        self,
+        initial_basis: Tensor,
+        initial_normalizer: Tensor,
+        terms: MemoryWriteTerms,
+        query_source: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        query_features = self.query_features(query_source)
+        decay = terms.decay.squeeze(-1)
+        cumulative_log_decay = torch.cumsum(torch.log(decay.float()), dim=1)
+        prior_log_decay = cumulative_log_decay - torch.log(decay.float())
+        initial_factors = torch.exp(prior_log_decay).to(dtype=terms.value.dtype)
+        length = terms.value.shape[1]
+        positions = torch.arange(length, device=terms.value.device)
+        past_writes = positions.unsqueeze(1) > positions.unsqueeze(0)
+        pair_log_decay = prior_log_decay.unsqueeze(-1) - cumulative_log_decay.unsqueeze(1)
+        pair_decay = torch.exp(pair_log_decay.masked_fill(~past_writes, float("-inf"))).to(
+            dtype=terms.value.dtype
+        )
+        feature_similarity = torch.einsum("bsm,btm->bts", terms.features, query_features)
+        write_influence = pair_decay * feature_similarity * terms.write_weight.unsqueeze(1)
+        initial_numerator = torch.einsum("bdm,btm->btd", initial_basis, query_features)
+        numerator = initial_factors.unsqueeze(-1) * initial_numerator
+        numerator = numerator + torch.einsum("bts,bsd->btd", write_influence, terms.value)
+        initial_denominator = torch.einsum("bm,btm->bt", initial_normalizer, query_features)
+        denominator = initial_factors * initial_denominator + write_influence.sum(dim=-1)
+        read = self.confidence_weighted_read(numerator, denominator.unsqueeze(-1))
+
+        total_log_decay = cumulative_log_decay[:, -1]
+        initial_final_factor = torch.exp(total_log_decay).to(dtype=terms.value.dtype)
+        final_write_decay = torch.exp(total_log_decay.unsqueeze(1) - cumulative_log_decay).to(
+            dtype=terms.value.dtype
+        )
+        final_write_weight = final_write_decay * terms.write_weight
+        final_basis = initial_final_factor.unsqueeze(-1).unsqueeze(-1) * initial_basis
+        final_basis = final_basis + torch.einsum(
+            "bs,bsd,bsm->bdm",
+            final_write_weight,
+            terms.value,
+            terms.features,
+        )
+        final_normalizer = initial_final_factor.unsqueeze(-1) * initial_normalizer
+        final_normalizer = final_normalizer + torch.einsum(
+            "bs,bsm->bm",
+            final_write_weight,
+            terms.features,
+        )
+        return read, final_basis, final_normalizer
+
+    def query_features(self, query_source: Tensor) -> Tensor:
+        query = self.query_projection(query_source)
+        return torch.softmax(self.feature_projection(query), dim=-1)
+
+    def confidence_weighted_read(self, numerator: Tensor, denominator: Tensor) -> Tensor:
+        regularized_denominator = denominator + self.epsilon
+        confidence = denominator / regularized_denominator
+        return confidence * numerator / regularized_denominator
 
     def fast_write_terms(self, projection: MemoryProjection, surprise: Tensor) -> MemoryWriteTerms:
         write_weight = projection.write_weight * (0.25 + 0.75 * surprise.clamp(0.0, 1.0))
@@ -100,11 +176,7 @@ class HierarchicalAssociativeMemory(nn.Module):
         features: Tensor,
         write_weight: Tensor,
     ) -> MemoryWriteTerms:
-        basis_increment = write_weight.unsqueeze(-1).unsqueeze(-1) * (
-            value.unsqueeze(-1) @ features.unsqueeze(-2)
-        )
-        normalizer_increment = write_weight.unsqueeze(-1) * features
-        return MemoryWriteTerms(decay, basis_increment, normalizer_increment)
+        return MemoryWriteTerms(decay, value, features, write_weight)
 
     def update(
         self,
@@ -218,6 +290,58 @@ class LocalKeyValueMemory(nn.Module):
             all_values[:, -self.local_memory_size :],
             all_valid[:, -self.local_memory_size :],
         )
+
+    def read_salient_window(
+        self,
+        carried_keys: Tensor,
+        carried_values: Tensor,
+        carried_valid: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        admission_mask: Tensor,
+        queries: Tensor,
+    ) -> Tensor:
+        batch_size, length, width = queries.shape
+        carried_length = carried_keys.shape[1]
+        all_keys = torch.cat((carried_keys, keys), dim=1)
+        all_values = torch.cat((carried_values, values), dim=1)
+        carried_eligible = carried_valid.unsqueeze(1).expand(batch_size, length, carried_length)
+        positions = torch.arange(length, device=queries.device)
+        prior_positions = positions.unsqueeze(1) > positions.unsqueeze(0)
+        current_eligible = admission_mask.unsqueeze(1) & prior_positions.unsqueeze(0)
+        eligible = torch.cat((carried_eligible, current_eligible), dim=-1)
+        scores = torch.einsum("bsd,btd->bts", all_keys, queries) / math.sqrt(width)
+        masked_scores = scores.masked_fill(~eligible, NEGATIVE_INFINITY)
+        any_slot = eligible.any(dim=-1, keepdim=True)
+        weights = torch.softmax(masked_scores, dim=-1)
+        weights = torch.where(any_slot, weights, torch.zeros_like(weights))
+        return torch.einsum("bts,bsd->btd", weights, all_values)
+
+    def salient_tail(
+        self,
+        carried_keys: Tensor,
+        carried_values: Tensor,
+        carried_valid: Tensor,
+        keys: Tensor,
+        values: Tensor,
+        admission_mask: Tensor,
+        capacity: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        all_keys = torch.cat((carried_keys, keys), dim=1)
+        all_values = torch.cat((carried_values, values), dim=1)
+        all_valid = torch.cat((carried_valid, admission_mask), dim=1)
+        if all_keys.shape[1] <= capacity:
+            return all_keys, all_values, all_valid
+        temporal_indices = torch.arange(all_keys.shape[1], device=all_keys.device).unsqueeze(0).expand_as(all_valid)
+        ranked_indices = torch.where(all_valid, temporal_indices, torch.full_like(temporal_indices, -1))
+        selected_indices = ranked_indices.topk(capacity, dim=1, largest=True).indices.sort(dim=1).values
+        selected_valid = all_valid.gather(1, selected_indices)
+        expanded_indices = selected_indices.unsqueeze(-1).expand(-1, -1, all_keys.shape[-1])
+        selected_keys = all_keys.gather(1, expanded_indices)
+        selected_values = all_values.gather(1, expanded_indices)
+        selected_keys = torch.where(selected_valid.unsqueeze(-1), selected_keys, torch.zeros_like(selected_keys))
+        selected_values = torch.where(selected_valid.unsqueeze(-1), selected_values, torch.zeros_like(selected_values))
+        return selected_keys, selected_values, selected_valid
 
     def append(
         self,

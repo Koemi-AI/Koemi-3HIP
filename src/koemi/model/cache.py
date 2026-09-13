@@ -23,6 +23,9 @@ class CacheStatistics:
     evictions: int
     expirations: int = 0
     deletions: int = 0
+    prefix_hits: int = 0
+    prefix_misses: int = 0
+    prefix_tokens_reused: int = 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,12 @@ class CachedMapping:
     expert_indices: Tensor
     valid_positions: Tensor
     token_count: int
+
+
+@dataclass(frozen=True)
+class CachedPrefixState:
+    last_logits: Tensor
+    state: KoemiState
 
 
 class WarmTokenCache:
@@ -132,6 +141,9 @@ class DiskMappingCache:
         self._evictions = 0
         self._expirations = 0
         self._deletions = 0
+        self._prefix_hits = 0
+        self._prefix_misses = 0
+        self._prefix_tokens_reused = 0
 
     def get(self, input_ids: Tensor, device: torch.device) -> CachedMapping | None:
         cache_path = self.path_for(input_ids)
@@ -141,6 +153,9 @@ class DiskMappingCache:
         if self.is_expired(cache_path):
             cache_path.unlink(missing_ok=True)
             self._expirations += 1
+            self._misses += 1
+            return None
+        if cache_path.stat().st_size > self.max_entry_bytes:
             self._misses += 1
             return None
         try:
@@ -158,7 +173,7 @@ class DiskMappingCache:
             return
         cache_path = self.path_for(input_ids)
         payload = {
-            "format_version": 1,
+            "format_version": 2,
             "logits": mapping.logits.detach().cpu(),
             "working_state": mapping.state.working_state.detach().cpu(),
             "memory_basis": mapping.state.memory_basis.detach().cpu(),
@@ -168,6 +183,9 @@ class DiskMappingCache:
             "local_keys": mapping.state.local_keys.detach().cpu(),
             "local_values": mapping.state.local_values.detach().cpu(),
             "local_valid": mapping.state.local_valid.detach().cpu(),
+            "salient_keys": mapping.state.salient_keys.detach().cpu(),
+            "salient_values": mapping.state.salient_values.detach().cpu(),
+            "salient_valid": mapping.state.salient_valid.detach().cpu(),
             "last_token_ids": mapping.state.last_token_ids.detach().cpu(),
             "step_index": mapping.state.step_index,
             "surprise_values": mapping.surprise_values.detach().cpu(),
@@ -201,6 +219,9 @@ class DiskMappingCache:
             mapping.state.local_keys,
             mapping.state.local_values,
             mapping.state.local_valid,
+            mapping.state.salient_keys,
+            mapping.state.salient_values,
+            mapping.state.salient_valid,
             mapping.state.last_token_ids,
             mapping.surprise_values,
             mapping.expert_indices,
@@ -215,9 +236,104 @@ class DiskMappingCache:
         digest = hashlib.blake2b(token_bytes, digest_size=20).hexdigest()
         return self.directory / f"koemi-mapping-{self._namespace_digest}-{digest}.pt"
 
+    def prefix_path_for(self, input_ids: Tensor) -> Path:
+        prefix_paths = self.prefix_paths(input_ids)
+        if not prefix_paths:
+            raise ValueError("prefix cache input must not be empty")
+        return prefix_paths[-1]
+
+    def get_longest_prefix(
+        self,
+        input_ids: Tensor,
+        device: torch.device,
+    ) -> tuple[int, CachedPrefixState] | None:
+        prefix_paths = self.prefix_paths(input_ids)
+        for prefix_length in range(len(prefix_paths), 0, -1):
+            cache_path = prefix_paths[prefix_length - 1]
+            if not cache_path.exists() or not cache_path.is_file():
+                continue
+            if self.is_expired(cache_path):
+                cache_path.unlink(missing_ok=True)
+                self._expirations += 1
+                continue
+            if cache_path.stat().st_size > self.max_entry_bytes:
+                continue
+            try:
+                payload = torch.load(cache_path, map_location=device, weights_only=True)
+                cached_prefix = self.validate_prefix_payload(payload, prefix_length)
+                os.utime(cache_path, None)
+            except (OSError, RuntimeError, ValueError, TypeError, EOFError, IndexError, KeyError, pickle.UnpicklingError):
+                continue
+            self._prefix_hits += 1
+            self._prefix_tokens_reused += prefix_length
+            return prefix_length, cached_prefix
+        self._prefix_misses += 1
+        return None
+
+    def put_prefix(self, input_ids: Tensor, cached_prefix: CachedPrefixState) -> None:
+        if self.estimate_prefix_bytes(cached_prefix) > self.max_entry_bytes:
+            return
+        cache_path = self.prefix_path_for(input_ids)
+        payload = {
+            "format_version": 1,
+            "entry_type": "prefix_state",
+            "prefix_length": input_ids.shape[1],
+            "last_logits": cached_prefix.last_logits.detach().cpu(),
+            "working_state": cached_prefix.state.working_state.detach().cpu(),
+            "memory_basis": cached_prefix.state.memory_basis.detach().cpu(),
+            "memory_normalizer": cached_prefix.state.memory_normalizer.detach().cpu(),
+            "refine_basis": cached_prefix.state.refine_basis.detach().cpu(),
+            "refine_normalizer": cached_prefix.state.refine_normalizer.detach().cpu(),
+            "local_keys": cached_prefix.state.local_keys.detach().cpu(),
+            "local_values": cached_prefix.state.local_values.detach().cpu(),
+            "local_valid": cached_prefix.state.local_valid.detach().cpu(),
+            "salient_keys": cached_prefix.state.salient_keys.detach().cpu(),
+            "salient_values": cached_prefix.state.salient_values.detach().cpu(),
+            "salient_valid": cached_prefix.state.salient_valid.detach().cpu(),
+            "last_token_ids": cached_prefix.state.last_token_ids.detach().cpu(),
+            "step_index": cached_prefix.state.step_index,
+        }
+        self.write_payload(cache_path, payload)
+        self.purge_expired()
+        self.evict_old_entries()
+
+    def estimate_prefix_bytes(self, cached_prefix: CachedPrefixState) -> int:
+        tensors = (
+            cached_prefix.last_logits,
+            cached_prefix.state.working_state,
+            cached_prefix.state.memory_basis,
+            cached_prefix.state.memory_normalizer,
+            cached_prefix.state.refine_basis,
+            cached_prefix.state.refine_normalizer,
+            cached_prefix.state.local_keys,
+            cached_prefix.state.local_values,
+            cached_prefix.state.local_valid,
+            cached_prefix.state.salient_keys,
+            cached_prefix.state.salient_values,
+            cached_prefix.state.salient_valid,
+            cached_prefix.state.last_token_ids,
+        )
+        return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+
+    def prefix_paths(self, input_ids: Tensor) -> tuple[Path, ...]:
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise ValueError("prefix cache requires input_ids with shape [1, sequence]")
+        digest = hashlib.blake2b(self.namespace.encode("utf-8"), digest_size=20).digest()
+        paths = []
+        for prefix_length, raw_token_id in enumerate(input_ids.detach().cpu().reshape(-1).tolist(), start=1):
+            token_id = int(raw_token_id)
+            if not 0 <= token_id <= 0xFFFF:
+                raise ValueError("prefix cache token id is outside the supported range")
+            digest = hashlib.blake2b(digest + token_id.to_bytes(2, "little"), digest_size=20).digest()
+            paths.append(
+                self.directory
+                / f"koemi-prefix-{self._namespace_digest}-{prefix_length}-{digest.hex()}.pt"
+            )
+        return tuple(paths)
+
     def evict_old_entries(self) -> None:
         cache_files = sorted(
-            (path for path in self.directory.glob(f"koemi-mapping-{self._namespace_digest}-*.pt") if path.is_file()),
+            self.namespace_files(),
             key=lambda path: path.stat().st_atime,
         )
         while len(cache_files) > self.capacity:
@@ -246,6 +362,14 @@ class DiskMappingCache:
         self._deletions += 1
         return True
 
+    def delete_prefix(self, input_ids: Tensor) -> bool:
+        cache_path = self.prefix_path_for(input_ids)
+        if not cache_path.exists():
+            return False
+        cache_path.unlink()
+        self._deletions += 1
+        return True
+
     def clear(self) -> int:
         deletion_count = 0
         for cache_path in self.namespace_files():
@@ -255,14 +379,12 @@ class DiskMappingCache:
         return deletion_count
 
     def namespace_files(self) -> tuple[Path, ...]:
-        return tuple(
-            path
-            for path in self.directory.glob(f"koemi-mapping-{self._namespace_digest}-*.pt")
-            if path.is_file()
-        )
+        mapping_files = self.directory.glob(f"koemi-mapping-{self._namespace_digest}-*.pt")
+        prefix_files = self.directory.glob(f"koemi-prefix-{self._namespace_digest}-*.pt")
+        return tuple(path for path in (*mapping_files, *prefix_files) if path.is_file())
 
     def validate_payload(self, payload: Any) -> CachedMapping:
-        if not isinstance(payload, dict) or payload.get("format_version") != 1:
+        if not isinstance(payload, dict) or payload.get("format_version") not in {1, 2}:
             raise ValueError("disk cache entry format is invalid")
         tensor_names = (
             "logits",
@@ -306,6 +428,20 @@ class DiskMappingCache:
             raise ValueError("disk cache entry context tokens are invalid")
         if payload["token_count"] < 0 or payload["token_count"] > int(payload["valid_positions"].sum()):
             raise ValueError("disk cache entry token count is invalid")
+        if payload["format_version"] == 1:
+            salient_keys = payload["local_keys"].new_empty(payload["local_keys"].shape[0], 0, payload["local_keys"].shape[2])
+            salient_values = salient_keys.clone()
+            salient_valid = payload["local_valid"].new_empty(payload["local_valid"].shape[0], 0)
+        else:
+            if not all(isinstance(payload.get(name), Tensor) for name in ("salient_keys", "salient_values", "salient_valid")):
+                raise ValueError("disk cache entry salient state is invalid")
+            salient_keys = payload["salient_keys"]
+            salient_values = payload["salient_values"]
+            salient_valid = payload["salient_valid"]
+            if salient_keys.ndim != 3 or salient_values.shape != salient_keys.shape:
+                raise ValueError("disk cache entry salient values are invalid")
+            if salient_valid.shape != salient_keys.shape[:2]:
+                raise ValueError("disk cache entry salient mask is invalid")
         state = KoemiState(
             working_state=payload["working_state"],
             memory_basis=payload["memory_basis"],
@@ -315,6 +451,9 @@ class DiskMappingCache:
             local_keys=payload["local_keys"],
             local_values=payload["local_values"],
             local_valid=payload["local_valid"].to(dtype=torch.bool),
+            salient_keys=salient_keys,
+            salient_values=salient_values,
+            salient_valid=salient_valid.to(dtype=torch.bool),
             last_token_ids=payload["last_token_ids"].to(dtype=torch.long),
             step_index=int(payload["step_index"]),
         )
@@ -327,7 +466,91 @@ class DiskMappingCache:
             token_count=int(payload["token_count"]),
         )
 
+    def validate_prefix_payload(self, payload: Any, expected_prefix_length: int) -> CachedPrefixState:
+        if not isinstance(payload, dict) or payload.get("format_version") != 1:
+            raise ValueError("prefix cache entry format is invalid")
+        if payload.get("entry_type") != "prefix_state" or payload.get("prefix_length") != expected_prefix_length:
+            raise ValueError("prefix cache entry identity is invalid")
+        tensor_names = (
+            "last_logits",
+            "working_state",
+            "memory_basis",
+            "memory_normalizer",
+            "refine_basis",
+            "refine_normalizer",
+            "local_keys",
+            "local_values",
+            "local_valid",
+            "salient_keys",
+            "salient_values",
+            "salient_valid",
+            "last_token_ids",
+        )
+        if not all(isinstance(payload.get(name), Tensor) for name in tensor_names):
+            raise ValueError("prefix cache entry tensors are invalid")
+        if payload["last_logits"].ndim != 2 or payload["last_logits"].shape[0] != 1:
+            raise ValueError("prefix cache logits are invalid")
+        if not isinstance(payload.get("step_index"), int) or payload["step_index"] != expected_prefix_length:
+            raise ValueError("prefix cache step index is invalid")
+        batch_size = payload["last_logits"].shape[0]
+        if payload["working_state"].ndim != 2 or payload["working_state"].shape[0] != batch_size:
+            raise ValueError("prefix cache working state is invalid")
+        if payload["memory_basis"].ndim != 3 or payload["memory_basis"].shape[0] != batch_size:
+            raise ValueError("prefix cache associative basis is invalid")
+        if payload["memory_normalizer"].shape != (batch_size, payload["memory_basis"].shape[2]):
+            raise ValueError("prefix cache associative normalizer is invalid")
+        if payload["refine_basis"].shape != payload["memory_basis"].shape:
+            raise ValueError("prefix cache refine basis is invalid")
+        if payload["refine_normalizer"].shape != payload["memory_normalizer"].shape:
+            raise ValueError("prefix cache refine normalizer is invalid")
+        for key_name, value_name, valid_name in (
+            ("local_keys", "local_values", "local_valid"),
+            ("salient_keys", "salient_values", "salient_valid"),
+        ):
+            if payload[key_name].ndim != 3 or payload[value_name].shape != payload[key_name].shape:
+                raise ValueError(f"prefix cache {key_name} are invalid")
+            if payload[valid_name].shape != payload[key_name].shape[:2]:
+                raise ValueError(f"prefix cache {valid_name} is invalid")
+        if payload["last_token_ids"].shape != (batch_size,):
+            raise ValueError("prefix cache context tokens are invalid")
+        state = KoemiState(
+            working_state=payload["working_state"],
+            memory_basis=payload["memory_basis"],
+            memory_normalizer=payload["memory_normalizer"],
+            refine_basis=payload["refine_basis"],
+            refine_normalizer=payload["refine_normalizer"],
+            local_keys=payload["local_keys"],
+            local_values=payload["local_values"],
+            local_valid=payload["local_valid"].to(dtype=torch.bool),
+            salient_keys=payload["salient_keys"],
+            salient_values=payload["salient_values"],
+            salient_valid=payload["salient_valid"].to(dtype=torch.bool),
+            last_token_ids=payload["last_token_ids"].to(dtype=torch.long),
+            step_index=payload["step_index"],
+        )
+        return CachedPrefixState(payload["last_logits"], state)
+
+    def write_payload(self, cache_path: Path, payload: dict[str, Any]) -> None:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=f"{cache_path.stem}-", suffix=".tmp", dir=self.directory, delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        try:
+            torch.save(payload, temporary_path)
+            if temporary_path.stat().st_size <= self.max_entry_bytes:
+                os.replace(temporary_path, cache_path)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
     def statistics(self) -> CacheStatistics:
         return CacheStatistics(
-            self._hits, self._misses, self._evictions, self._expirations, self._deletions
+            self._hits,
+            self._misses,
+            self._evictions,
+            self._expirations,
+            self._deletions,
+            self._prefix_hits,
+            self._prefix_misses,
+            self._prefix_tokens_reused,
         )

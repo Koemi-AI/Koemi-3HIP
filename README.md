@@ -1,8 +1,9 @@
 # Koemi-2OBOV
 
 Koemi-2OBOV is a PyTorch training base for byte-level causal models built on
-HERM (Hierarchical Error-Refined Memory): bounded recurrent state, fast and
-slow associative memory, local exact recall and optional deterministic experts.
+HERM (Hierarchical Error-Refined Memory): bounded recurrent state, rank-one
+associative memory, exact recent and salient recall, and optional deterministic
+experts. The slower refine tier is opt-in.
 
 This repository contains architecture and training code. It does not ship a
 trained model and does not claim Transformer-level quality.
@@ -10,8 +11,9 @@ trained model and does not claim Transformer-level quality.
 ## Problem
 
 Large attention models spend memory and compute repeatedly processing context.
-HERM keeps bounded fast and slow states for the running sequence, a small exact local buffer,
-and an associative state that can be updated with a parallel affine scan.
+HERM keeps bounded associative state for the running sequence plus exact local
+and surprise-admitted buffers. Prefix-state snapshots let a later request resume
+from the longest byte-identical prefix instead of replaying it.
 
 ## Install
 
@@ -110,11 +112,12 @@ output marker, for a checkpoint trained with thinking spans. `--raw-prompt` send
 `--prompt` verbatim and prints the whole text, which is what a checkpoint trained
 on plain text needs; combining it with `--system` is refused.
 
-The RAM cache reuses detached embeddings by token id. The optional mapping
-cache stores the output and recurrent state for an exact input sequence under an
-explicit tenant/session plus checkpoint namespace and content hash. Entries
-expire under a sliding TTL and can be cleared only inside that namespace. It is
-suitable for repeated identical prompts, not semantic similarity.
+The RAM cache reuses detached embeddings by token id. The optional mapping cache
+also writes fixed-width state snapshots at scan boundaries and at the end of a
+prompt. A later request restores the longest byte-identical prefix and processes
+only its suffix. Entries use an explicit tenant/session plus checkpoint namespace,
+expire under a sliding TTL and can be cleared only inside that namespace. This is
+exact prefix reuse, not semantic similarity.
 
 ## Architecture
 
@@ -122,18 +125,20 @@ suitable for repeated identical prompts, not semantic similarity.
 flowchart LR
     Input[UTF-8 bytes] --> Embedding
     Warm[RAM token cache] -.-> Embedding
-    Disk[Optional SSD mapping cache] -. exact sequence .-> Output
+    Disk[Optional SSD prefix ledger] -. longest exact prefix .-> Recurrent
     Embedding --> Recurrent[Bounded recurrent state]
     Recurrent --> Fast[Fast associative memory]
     Fast --> Residual[Reconstruction residual]
     Residual --> Slow[Slow refine memory]
     Recurrent --> Local[Exact local KV ring]
+    Recurrent --> Salient[Exact surprise-admitted ring]
     Recurrent --> Surprise[Linear causal surprise]
     Surprise --> Fast
     Surprise --> Slow
     Fast --> Fusion[Linear fusion]
     Slow --> Fusion
     Local --> Fusion
+    Salient --> Fusion
     Recurrent --> Fusion
     Fusion --> MoE[Optional contextual deterministic MoE]
     MoE --> Output[Linear byte predictor]
@@ -154,13 +159,15 @@ Titans. The Google overview identifies Titans as a concrete architecture and
 MIRAS as the broader framework; Titans uses a deeper online-updated neural
 memory than HERM does.
 
-For positive features `phi`, the fast tier reads
-`B_t phi(q) / (z_t dot phi(q) + epsilon)` and updates with
+For positive features `phi`, the fast tier computes an epsilon-regularized read
+and multiplies it by
+`confidence = denominator / (denominator + epsilon)`. It updates with
 `B_t = lambda_t B_(t-1) + w_t v_t phi(k_t)^T`. The slow tier receives the
 bounded reconstruction residual `v_t - read_fast_t`, decays more slowly with
 `lambda_s = 1 - (1 - lambda_t) rho`, and writes only in proportion to causal
-surprise and local novelty. State remains fixed-width and both recurrences are
-compatible with the same affine scan oracle.
+surprise and local novelty when `--ablation herm` is selected. The parallel read
+keeps the rank-one factors and contracts them through a causal `[B,C,C]` matrix;
+it does not materialize `[B,L,d,m]` basis states.
 
 ### Surprise and chains
 
@@ -273,6 +280,8 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--embedding-size` | `64` | Width of token embeddings and recurrent state. |
 | `--memory-features` | `16` | Width of associative memory features. |
 | `--local-memory-size` | `16` | Number of exact local key-value slots. |
+| `--salience-memory-size` | `16` | Number of exact surprise-admitted slots. |
+| `--salience-threshold` | `0.75` | Causal surprise required for salient admission. |
 | `--expert-count` | `0` | Context-hash expert count; zero disables MoE. |
 | `--cache-capacity` | `256` | Maximum RAM token embeddings. |
 | `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
@@ -289,7 +298,7 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
 | `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
 | `--num-workers` | `0` | DataLoader worker processes. |
-| `--ablation` | `herm` | `herm`, `no_refine`, `no_surprise` or `affine` control. |
+| `--ablation` | `no_refine` | Fast tier by default; `herm` enables refine, with `no_surprise` and `affine` controls. |
 | `--device` | CUDA if available | PyTorch device used for training or generation. |
 | `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
 
@@ -309,6 +318,8 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 ## Known limitations
 
+- Checkpoint format 7 adds the salient fusion input. Formats 5 and 6 are refused
+  because their expert partition or fusion weights describe a different model.
 - Contextual deterministic experts are not learned semantic routing. Learned
   expert selection would reintroduce a router, contrary to this architecture.
 - The role markers are reserved. A dataset span or an inference prompt carrying
@@ -320,9 +331,10 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 - The offload store writes parameter files outside the checkpoint. Point
   `--offload-store` at a private directory: the files are plain weights and no
   namespace or expiry protects them.
-- The disk cache reuses exact hashed sequences only; “similar question” reuse
-  needs retrieval and a similarity contract outside this phase.
-- Disk entries contain recurrent state and logits and can encode prompt content.
+- The disk cache reuses byte-identical prefixes only; a similar question needs
+  retrieval and a similarity contract outside this phase.
+- Disk entries contain recurrent state and final logits and can encode prompt
+  content.
   The cache is opt-in, requires an explicit namespace and provides TTL,
   namespace-local deletion and size/capacity limits. Payload encryption is not
   provided.
@@ -331,8 +343,8 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
   HDD.
 - There is no `asyncio` cognition scheduler or arbitrary layer offload. HERM's
   concurrency is tensor-level parallelism inside the causal scan window.
-- The two associative tiers may still lose multi-key interactions. MQAR and
-  long-context recall are still required.
+- The associative tier and optional refine tier may still lose multi-key
+  interactions. MQAR and long-context recall are still required.
 - UTF-8 byte tokenization uses more positions than a learned tokenizer.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.

@@ -187,11 +187,13 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--embedding-size", type=int, default=64)
     parser.add_argument("--memory-features", type=int, default=16)
     parser.add_argument("--local-memory-size", type=int, default=16)
+    parser.add_argument("--salience-memory-size", type=int, default=16)
+    parser.add_argument("--salience-threshold", type=float, default=0.75)
     parser.add_argument("--expert-count", type=int, default=0)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--scan-chunk", type=int, default=128)
     parser.add_argument("--refine-decay-rate", type=float, default=0.0625)
-    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="herm")
+    parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="no_refine")
 
 
 def inspect_dataset(arguments: argparse.Namespace, logger) -> int:
@@ -382,7 +384,8 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
     logger.info(
         "generation_completed generated_bytes=%s cache_hits=%s cache_misses=%s cache_evictions=%s "
-        "mapping_hits=%s mapping_misses=%s mapping_evictions=%s mapping_expirations=%s mapping_deletions=%s",
+        "mapping_hits=%s mapping_misses=%s mapping_evictions=%s mapping_expirations=%s mapping_deletions=%s "
+        "prefix_hits=%s prefix_misses=%s prefix_tokens_reused=%s",
         len(completion.encode("utf-8")),
         statistics.hits,
         statistics.misses,
@@ -392,6 +395,9 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         mapping_statistics.evictions if mapping_statistics else 0,
         mapping_statistics.expirations if mapping_statistics else 0,
         mapping_statistics.deletions if mapping_statistics else 0,
+        mapping_statistics.prefix_hits if mapping_statistics else 0,
+        mapping_statistics.prefix_misses if mapping_statistics else 0,
+        mapping_statistics.prefix_tokens_reused if mapping_statistics else 0,
     )
     write_utf8(completion)
     return 0
@@ -413,6 +419,8 @@ def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
         embedding_size=arguments.embedding_size,
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,
+        salience_memory_size=arguments.salience_memory_size,
+        salience_threshold=arguments.salience_threshold,
         expert_count=arguments.expert_count,
         cache_capacity=arguments.cache_capacity,
         scan_chunk=arguments.scan_chunk,

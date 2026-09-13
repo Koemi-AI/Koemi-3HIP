@@ -40,6 +40,8 @@ class ExecutionEquivalenceTests(unittest.TestCase):
         self.assertTrue(torch.allclose(parallel.state.refine_normalizer, sequential.state.refine_normalizer, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.local_keys, sequential.state.local_keys, atol=1e-4))
         self.assertTrue(torch.equal(parallel.state.local_valid, sequential.state.local_valid))
+        self.assertTrue(torch.allclose(parallel.state.salient_keys, sequential.state.salient_keys, atol=1e-4))
+        self.assertTrue(torch.equal(parallel.state.salient_valid, sequential.state.salient_valid))
         self.assertTrue(torch.equal(parallel.state.last_token_ids, sequential.state.last_token_ids))
         self.assertEqual(parallel.state.step_index, sequential.state.step_index)
 
@@ -78,6 +80,8 @@ class ExecutionEquivalenceTests(unittest.TestCase):
         self.assertTrue(torch.allclose(parallel.state.refine_basis, sequential.state.refine_basis, atol=1e-4))
         self.assertTrue(torch.allclose(parallel.state.local_keys, sequential.state.local_keys, atol=1e-4))
         self.assertTrue(torch.equal(parallel.state.local_valid, sequential.state.local_valid))
+        self.assertTrue(torch.allclose(parallel.state.salient_keys, sequential.state.salient_keys, atol=1e-4))
+        self.assertTrue(torch.equal(parallel.state.salient_valid, sequential.state.salient_valid))
         self.assertTrue(torch.equal(parallel.state.last_token_ids, sequential.state.last_token_ids))
 
     def test_one_pass_agrees_with_step_by_step_decoding(self) -> None:
@@ -96,14 +100,24 @@ class ExecutionEquivalenceTests(unittest.TestCase):
         self.assertTrue(torch.allclose(whole.logits, torch.cat(stepped, dim=1), atol=1e-4))
 
     def test_gradients_agree_between_paths(self) -> None:
-        torch.manual_seed(4)
-        model = build_model(expert_count=0)
-        input_ids = torch.randint(0, 255, (2, 16), dtype=torch.long)
-        gradients = {}
-        for mode in (ExecutionMode.PARALLEL, ExecutionMode.SEQUENTIAL):
-            model.zero_grad(set_to_none=True)
-            model(input_ids, execution_mode=mode).logits.square().mean().backward()
-            gradients[mode] = model.fusion_projection.weight.grad.detach().clone()
-        difference = float((gradients[ExecutionMode.PARALLEL] - gradients[ExecutionMode.SEQUENTIAL]).abs().max())
-        scale = float(gradients[ExecutionMode.SEQUENTIAL].abs().max())
-        self.assertLess(difference, max(1e-5, scale * 1e-3), f"gradient difference {difference} against scale {scale}")
+        for ablation in ("no_refine", "herm"):
+            with self.subTest(ablation=ablation):
+                torch.manual_seed(4)
+                model = build_model(expert_count=0, ablation=ablation)
+                input_ids = torch.randint(0, 255, (2, 16), dtype=torch.long)
+                gradients = {}
+                for mode in (ExecutionMode.PARALLEL, ExecutionMode.SEQUENTIAL):
+                    model.zero_grad(set_to_none=True)
+                    model(input_ids, execution_mode=mode).logits.square().mean().backward()
+                    gradients[mode] = {
+                        name: None if parameter.grad is None else parameter.grad.detach().clone()
+                        for name, parameter in model.named_parameters()
+                    }
+                for name, sequential_gradient in gradients[ExecutionMode.SEQUENTIAL].items():
+                    parallel_gradient = gradients[ExecutionMode.PARALLEL][name]
+                    self.assertEqual(sequential_gradient is None, parallel_gradient is None, name)
+                    if sequential_gradient is None or parallel_gradient is None:
+                        continue
+                    difference = float((parallel_gradient - sequential_gradient).abs().max())
+                    scale = float(sequential_gradient.abs().max())
+                    self.assertLess(difference, max(1e-5, scale * 1e-3), name)
