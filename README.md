@@ -294,6 +294,12 @@ baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 - Contextual deterministic experts are not learned semantic routing. Learned
   expert selection would reintroduce a router, contrary to this architecture.
+- The role markers are reserved. A dataset span or an inference prompt carrying
+  `<|system|>`, `<|input|>`, `<|thinking|>` or `<|output|>` is refused at the
+  boundary, naming the field and the tag, because a byte vocabulary of 256 content
+  ids plus one padding id has no room for dedicated control tokens and forged text
+  would otherwise move a span boundary. `--raw-prompt` bypasses the check for a
+  checkpoint that was never trained with markers.
 - The offload store writes parameter files outside the checkpoint. Point
   `--offload-store` at a private directory: the files are plain weights and no
   namespace or expiry protects them.

@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from koemi.data.contracts import DatasetRecord
+from koemi.data.contracts import (
+    INPUT_TAG,
+    OUTPUT_TAG,
+    SYSTEM_TAG,
+    THINKING_TAG,
+    DatasetRecord,
+    reject_reserved_tags,
+)
 
 
-SYSTEM_MARKER = "<|system|>\n"
-INPUT_MARKER = "<|input|>\n"
-THINKING_MARKER = "\n<|thinking|>\n"
-OUTPUT_MARKER = "\n<|output|>\n"
+SYSTEM_MARKER = f"{SYSTEM_TAG}\n"
+INPUT_MARKER = f"{INPUT_TAG}\n"
+THINKING_MARKER = f"\n{THINKING_TAG}\n"
+OUTPUT_MARKER = f"\n{OUTPUT_TAG}\n"
 
 
 @dataclass(frozen=True)
@@ -18,6 +25,11 @@ class SerializedRecord:
     thinking_positions: tuple[bool, ...]
 
 
+def reject_prompt_tags(system_text: str | None, user_text: str) -> None:
+    reject_reserved_tags("system", system_text)
+    reject_reserved_tags("prompt", user_text)
+
+
 def system_prefix(system_text: str | None) -> str:
     if system_text is None:
         return ""
@@ -25,10 +37,12 @@ def system_prefix(system_text: str | None) -> str:
 
 
 def build_answer_prompt(system_text: str | None, user_text: str) -> str:
+    reject_prompt_tags(system_text, user_text)
     return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{OUTPUT_MARKER}"
 
 
 def build_thinking_prompt(system_text: str | None, user_text: str) -> str:
+    reject_prompt_tags(system_text, user_text)
     return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{THINKING_MARKER}"
 
 
