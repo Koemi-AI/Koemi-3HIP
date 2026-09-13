@@ -323,10 +323,11 @@ starts a new session.
 ### Contextual deterministic MoE
 
 When `--expert-count` is greater than zero, a mixing hash of the current byte and
-the previous byte selects one expert. There is no risk head, top-k selector,
-routing projection or routing loss. It is not learned semantic routing, but the
-assignment is now a function of content alone, so an expert receives the same
-bigrams every time it sees them.
+the previous byte selects `--expert-top-k` experts (one by default). The selected
+expert updates are averaged before normalization. There is no risk head, routing
+projection or routing loss. It is not learned semantic routing, but the assignment
+is a reproducible function of content alone, so a bigram receives the same expert
+set every time it appears.
 
 Absolute position used to enter the hash, which made the dispatch a random
 partition: the same bigram went to a different expert at every position, so no
@@ -337,7 +338,10 @@ is indistinguishable from uniform random; a 64-expert run on real data reported
 information. No expert is left idle and every expert receives between 10 and 29
 distinct bigrams. The busiest expert holds 3.3 times the uniform share; that skew
 is the skew of byte-bigram frequency, and it costs nothing because every token
-still passes through exactly one expert.
+With `--expert-top-k 1`, every valid token passes through exactly one expert. A
+`128/6` run is an explicit high-capacity experiment: six deterministic experts are
+active per token and all 128 experts are trainable. It is not the default and its
+load balance must be measured rather than assumed.
 
 The hash mixes its bits instead of combining terms linearly. The previous form was
 affine, so `remainder(expert_count)` saw only the low bits: with consecutive bytes,
@@ -427,6 +431,7 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--salience-memory-size` | `16` | Number of exact surprise-admitted slots. |
 | `--salience-threshold` | `0.75` | Causal surprise required for salient admission. |
 | `--expert-count` | `0` | Context-hash expert count; zero disables MoE. |
+| `--expert-top-k` | `1` | Number of deterministic experts active per valid token. |
 | `--cache-capacity` | `256` | Maximum RAM token embeddings. |
 | `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
 | `--refine-decay-rate` | `0.0625` | Slow-memory timescale relative to fast decay. |
@@ -454,6 +459,14 @@ contains the bounded causal evaluator, explicit answer/thinking denominators,
 moving-median curves and a monochrome pastel-yellow report style. Point
 `RUN_LOG` at a JSONL training log after a run; missing series are reported as
 missing rather than fabricated.
+
+For an overnight Colab T4 run, use
+[`notebooks/Koemi-3HIP_T4_Overnight.ipynb`](notebooks/Koemi-3HIP_T4_Overnight.ipynb).
+It streams the English conversational `HuggingFaceTB/smol-smoltalk` dataset,
+trains the explicit `128 experts / 6 active` deterministic MoE for five wall-clock
+hours, resumes from checkpoints, and exports loss/BPB, perplexity, throughput,
+GPU memory, surprise and expert-load evidence. The dataset card is the source of
+the license and corpus claims: https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk.
 
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json

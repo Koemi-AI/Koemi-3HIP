@@ -22,6 +22,15 @@ def assignment_for(mixture: DeterministicExpertMixture, tokens: list[int], previ
 
 
 class ContentDispatchTests(unittest.TestCase):
+    def test_top_k_assignment_returns_six_distinct_experts(self) -> None:
+        mixture = DeterministicExpertMixture(16, 128, top_k=6)
+        token_ids = torch.tensor([[97, 98, 99]], dtype=torch.long)
+        previous_ids = torch.tensor([[32, 97, 98]], dtype=torch.long)
+        assignments = mixture.assign_top_k(token_ids, previous_ids, torch.ones_like(token_ids, dtype=torch.bool))
+        self.assertEqual((1, 3, 6), tuple(assignments.shape))
+        self.assertTrue(bool((assignments >= 0).all()))
+        self.assertEqual(6, assignments.unique(dim=-1).shape[-1])
+
     def test_the_same_bigram_reaches_the_same_expert_at_every_position(self) -> None:
         mixture = build_mixture(64)
         tokens = [97, 98, 97, 98, 97, 98]
@@ -100,3 +109,17 @@ class DispatchThroughTheModelTests(unittest.TestCase):
         assignment = output.expert_indices[0].tolist()
         self.assertEqual(1, len(set(assignment[3::2])))
         self.assertEqual(1, len(set(assignment[2::2])))
+
+    def test_six_experts_are_active_per_valid_token_with_a_128_expert_bank(self) -> None:
+        model = KoemiModel(
+            ModelSettings(
+                embedding_size=16,
+                memory_features=4,
+                local_memory_size=4,
+                expert_count=128,
+                expert_top_k=6,
+            )
+        )
+        output = model(torch.tensor([[72, 101, 108, 108, 111]], dtype=torch.long))
+        self.assertEqual((1, 5, 6), tuple(output.active_expert_indices.shape))
+        self.assertEqual(30, sum(output.expert_activation_counts))

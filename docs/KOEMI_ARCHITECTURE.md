@@ -162,14 +162,14 @@ z_t = RMSNorm(W_z [h_t || m_t || l_t || a_t] + b_z)
 When `expert_count = E > 0`, dispatch is fixed and deterministic:
 
 ```text
-e_t = mix_hash(token_id_t, token_id_(t-1)) mod E
-y_t = RMSNorm(z_t + FFN_e_t(z_t))
+e_{t,k} = (mix_hash(token_id_t, token_id_(t-1)) + k·0x9E3779B9) mod E
+y_t = RMSNorm(z_t + (1/K) Σ_k FFN_{e_{t,k}}(z_t))
 ```
 
-Exactly one expert processes each valid token. There is no routing projection,
-risk head, top-k selector, soft mixture or routing loss. This is a deliberate
-trade-off: Koemi-3HIP has a predictable sparse expert bank, not learned semantic MoE
-dispatch. `expert_count = 0` skips the bank entirely.
+`K = expert_top_k` experts process each valid token (the default `K=1` preserves
+the legacy path). There is no routing projection, risk head, soft mixture or
+routing loss. This is a deliberate trade-off: Koemi-3HIP has a predictable sparse
+expert bank, not learned semantic MoE dispatch. `expert_count = 0` skips the bank.
 
 Absolute position is excluded so a repeated bigram has a stable expert. The
 mixing finalizer prevents power-of-two expert counts from reading only the low

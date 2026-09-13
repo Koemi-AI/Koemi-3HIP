@@ -26,9 +26,12 @@ def content_dispatch_hash(token_ids: Tensor, previous_token_ids: Tensor) -> Tens
 
 
 class DeterministicExpertMixture(nn.Module):
-    def __init__(self, embedding_size: int, expert_count: int) -> None:
+    def __init__(self, embedding_size: int, expert_count: int, top_k: int = 1) -> None:
         super().__init__()
         self.expert_count = expert_count
+        self.top_k = top_k
+        if expert_count < 0 or top_k < 1 or (expert_count > 0 and top_k > expert_count):
+            raise ValueError("top_k must be between one and expert_count")
         self.experts = nn.ModuleList(GatedFeedForward(embedding_size) for _ in range(expert_count))
         self.output_normalizer = RootMeanSquareNorm(embedding_size)
 
@@ -38,24 +41,33 @@ class DeterministicExpertMixture(nn.Module):
         token_ids: Tensor,
         previous_token_ids: Tensor,
         valid_mask: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         if self.expert_count == 0:
-            return context, torch.full_like(token_ids, UNASSIGNED_EXPERT)
-        assignment = self.assign(token_ids, previous_token_ids, valid_mask)
+            empty = torch.full_like(token_ids, UNASSIGNED_EXPERT)
+            return context, empty, empty.unsqueeze(-1)
+        assignments = self.assign_top_k(token_ids, previous_token_ids, valid_mask)
         flattened_context = context.reshape(-1, context.shape[-1])
-        flattened_assignment = assignment.reshape(-1)
-        mixed_context = context.reshape(-1, context.shape[-1]).clone()
+        flattened_assignments = assignments.reshape(-1, self.top_k)
+        mixed_context = flattened_context.clone()
+        expert_updates = torch.zeros_like(flattened_context)
         for expert_index, expert in enumerate(self.experts):
-            row_indices = torch.nonzero(flattened_assignment == expert_index, as_tuple=False).squeeze(-1)
+            row_indices = torch.nonzero((flattened_assignments == expert_index).any(dim=1), as_tuple=False).squeeze(-1)
             if row_indices.numel() == 0:
                 continue
             expert_context = expert(flattened_context.index_select(0, row_indices))
-            updated_context = self.output_normalizer(
-                flattened_context.index_select(0, row_indices) + expert_context
-            )
-            mixed_context.index_copy_(0, row_indices, updated_context)
-        return mixed_context.reshape_as(context), assignment
+            expert_updates.index_add_(0, row_indices, expert_context / self.top_k)
+        valid_rows = valid_mask.reshape(-1)
+        updated_context = self.output_normalizer(flattened_context + expert_updates)
+        mixed_context = torch.where(valid_rows.unsqueeze(-1), updated_context, flattened_context)
+        return mixed_context.reshape_as(context), assignments[:, :, 0], assignments
 
     def assign(self, token_ids: Tensor, previous_token_ids: Tensor, valid_mask: Tensor) -> Tensor:
+        return self.assign_top_k(token_ids, previous_token_ids, valid_mask)[:, :, 0]
+
+    def assign_top_k(self, token_ids: Tensor, previous_token_ids: Tensor, valid_mask: Tensor) -> Tensor:
+        if self.expert_count == 0:
+            return torch.full((*token_ids.shape, self.top_k), UNASSIGNED_EXPERT, dtype=torch.long, device=token_ids.device)
         context_hash = content_dispatch_hash(token_ids, previous_token_ids)
-        return context_hash.remainder(self.expert_count).masked_fill(~valid_mask, UNASSIGNED_EXPERT)
+        offsets = torch.arange(self.top_k, device=token_ids.device, dtype=context_hash.dtype)
+        assignments = (context_hash.unsqueeze(-1) + offsets * 0x9E3779B9).remainder(self.expert_count)
+        return assignments.masked_fill(~valid_mask.unsqueeze(-1), UNASSIGNED_EXPERT)

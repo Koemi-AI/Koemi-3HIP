@@ -19,6 +19,7 @@ class ModelSettings:
     salience_memory_size: int = 16
     salience_threshold: float = 0.75
     expert_count: int = 0
+    expert_top_k: int = 1
     cache_capacity: int = 256
     scan_chunk: int = 128
     refine_decay_rate: float = 0.0625
@@ -39,8 +40,12 @@ class ModelSettings:
             raise ValueError("salience_threshold must be between zero and one")
         if self.scan_chunk < 1:
             raise ValueError("scan_chunk must be at least 1")
-        if not 0 <= self.expert_count <= 64:
-            raise ValueError("expert_count must be between 0 and 64")
+        if not 0 <= self.expert_count <= 128:
+            raise ValueError("expert_count must be between 0 and 128")
+        if self.expert_top_k < 1:
+            raise ValueError("expert_top_k must be at least 1")
+        if self.expert_count > 0 and self.expert_top_k > self.expert_count:
+            raise ValueError("expert_top_k must not exceed expert_count")
         if self.cache_capacity < 1:
             raise ValueError("cache_capacity must be at least 1")
         if not 0.0 < self.refine_decay_rate <= 1.0:

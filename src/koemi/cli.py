@@ -190,6 +190,7 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--salience-memory-size", type=int, default=16)
     parser.add_argument("--salience-threshold", type=float, default=0.75)
     parser.add_argument("--expert-count", type=int, default=0)
+    parser.add_argument("--expert-top-k", type=int, default=1)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--scan-chunk", type=int, default=128)
     parser.add_argument("--refine-decay-rate", type=float, default=0.0625)
@@ -422,6 +423,7 @@ def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
         salience_memory_size=arguments.salience_memory_size,
         salience_threshold=arguments.salience_threshold,
         expert_count=arguments.expert_count,
+        expert_top_k=arguments.expert_top_k,
         cache_capacity=arguments.cache_capacity,
         scan_chunk=arguments.scan_chunk,
         refine_decay_rate=arguments.refine_decay_rate,

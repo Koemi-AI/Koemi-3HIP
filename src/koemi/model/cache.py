@@ -34,6 +34,7 @@ class CachedMapping:
     state: KoemiState
     surprise_values: Tensor
     expert_indices: Tensor
+    active_expert_indices: Tensor | None
     valid_positions: Tensor
     token_count: int
 
@@ -190,6 +191,11 @@ class DiskMappingCache:
             "step_index": mapping.state.step_index,
             "surprise_values": mapping.surprise_values.detach().cpu(),
             "expert_indices": mapping.expert_indices.detach().cpu(),
+            "active_expert_indices": (
+                mapping.active_expert_indices.detach().cpu()
+                if mapping.active_expert_indices is not None
+                else None
+            ),
             "valid_positions": mapping.valid_positions.detach().cpu(),
             "token_count": mapping.token_count,
         }
@@ -227,6 +233,8 @@ class DiskMappingCache:
             mapping.expert_indices,
             mapping.valid_positions,
         )
+        if mapping.active_expert_indices is not None:
+            tensors = (*tensors, mapping.active_expert_indices)
         return sum(tensor.numel() * tensor.element_size() for tensor in tensors)
 
     def path_for(self, input_ids: Tensor) -> Path:
@@ -442,6 +450,11 @@ class DiskMappingCache:
                 raise ValueError("disk cache entry salient values are invalid")
             if salient_valid.shape != salient_keys.shape[:2]:
                 raise ValueError("disk cache entry salient mask is invalid")
+        active_expert_indices = payload.get("active_expert_indices")
+        if active_expert_indices is not None and not isinstance(active_expert_indices, Tensor):
+            raise ValueError("disk cache expert assignments are invalid")
+        if active_expert_indices is not None and active_expert_indices.shape[:2] != output_shape:
+            raise ValueError("disk cache expert assignment shape is invalid")
         state = KoemiState(
             working_state=payload["working_state"],
             memory_basis=payload["memory_basis"],
@@ -464,6 +477,7 @@ class DiskMappingCache:
             expert_indices=payload["expert_indices"],
             valid_positions=payload["valid_positions"].to(dtype=torch.bool),
             token_count=int(payload["token_count"]),
+            active_expert_indices=active_expert_indices,
         )
 
     def validate_prefix_payload(self, payload: Any, expected_prefix_length: int) -> CachedPrefixState:

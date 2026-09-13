@@ -276,6 +276,7 @@ def run_single_model(arguments: argparse.Namespace) -> BenchmarkReport:
         salience_memory_size=arguments.salience_memory_size,
         salience_threshold=arguments.salience_threshold,
         expert_count=arguments.expert_count,
+        expert_top_k=arguments.expert_top_k,
         ablation=arguments.ablation,
     )
     koemi_parameter_count, koemi_parameter_bytes = count_parameter_bytes(KoemiModel(model_settings))
@@ -369,6 +370,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--salience-memory-size", type=int, default=12)
     parser.add_argument("--salience-threshold", type=float, default=0.75)
     parser.add_argument("--expert-count", type=int, default=0)
+    parser.add_argument("--expert-top-k", type=int, default=1)
     parser.add_argument("--ablation", choices=("herm", "no_refine", "no_surprise", "affine"), default="no_refine")
     parser.add_argument("--report", default=None)
     return parser
