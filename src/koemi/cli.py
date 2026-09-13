@@ -133,6 +133,12 @@ def add_offload_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Directory holding parameters evicted to storage",
     )
+    parser.add_argument(
+        "--offload-residency-mib",
+        type=int,
+        default=0,
+        help="Memory kept as a read cache in front of the offload store, in MiB",
+    )
 
 
 def offload_request(arguments: argparse.Namespace) -> OffloadRequest:
@@ -140,6 +146,7 @@ def offload_request(arguments: argparse.Namespace) -> OffloadRequest:
         accelerator_bytes=mebibytes_to_bytes(arguments.offload_accelerator_mib),
         host_bytes=mebibytes_to_bytes(arguments.offload_host_mib),
         store_directory=arguments.offload_store,
+        residency_bytes=mebibytes_to_bytes(arguments.offload_residency_mib) or 0,
     )
 
 
@@ -157,7 +164,8 @@ def log_offload(engine: OffloadEngine, logger) -> None:
         "offload_plan accelerator_bytes=%s host_bytes=%s disk_bytes=%s "
         "accelerator_modules=%s host_modules=%s disk_modules=%s "
         "host_borrows=%s host_transferred_bytes=%s "
-        "disk_materializations=%s disk_read_bytes=%s disk_read_seconds=%.4f",
+        "disk_materializations=%s disk_read_bytes=%s disk_read_seconds=%.4f "
+        "residency_hits=%s residency_evictions=%s resident_bytes=%s",
         statistics.bytes_by_tier[ACCELERATOR_TIER],
         statistics.bytes_by_tier[HOST_TIER],
         statistics.bytes_by_tier[DISK_TIER],
@@ -169,6 +177,9 @@ def log_offload(engine: OffloadEngine, logger) -> None:
         statistics.disk_materializations,
         statistics.disk_read_bytes,
         statistics.disk_read_seconds,
+        statistics.residency_hits,
+        statistics.residency_evictions,
+        statistics.resident_bytes,
     )
 
 

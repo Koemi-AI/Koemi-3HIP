@@ -16,6 +16,7 @@ from koemi.runtime.offload import (
     ModuleTraffic,
     OffloadEngine,
     OffloadError,
+    ResidencyCache,
     TierBudget,
     calibrate_traffic,
     plan_placement,
@@ -304,3 +305,103 @@ class OffloadEquivalenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ResidencyCacheTests(unittest.TestCase):
+    def test_a_negative_capacity_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            ResidencyCache(-1)
+
+    def test_a_zero_capacity_never_caches(self) -> None:
+        cache = ResidencyCache(0)
+        cache.put("one", torch.zeros(4))
+        self.assertIsNone(cache.get("one"))
+        self.assertEqual(0, cache.resident_bytes)
+
+    def test_a_tensor_larger_than_the_capacity_is_not_cached(self) -> None:
+        cache = ResidencyCache(8)
+        cache.put("one", torch.zeros(4))
+        self.assertIsNone(cache.get("one"))
+
+    def test_a_cached_tensor_returns_the_same_object(self) -> None:
+        cache = ResidencyCache(1024)
+        tensor = torch.zeros(4)
+        cache.put("one", tensor)
+        self.assertIs(tensor, cache.get("one"))
+        self.assertEqual(1, cache.hits)
+
+    def test_the_least_recently_used_entry_leaves_first(self) -> None:
+        cache = ResidencyCache(32)
+        cache.put("one", torch.zeros(4))
+        cache.put("two", torch.zeros(4))
+        cache.get("one")
+        cache.put("three", torch.zeros(4))
+        self.assertIsNone(cache.get("two"))
+        self.assertIsNotNone(cache.get("one"))
+        self.assertIsNotNone(cache.get("three"))
+        self.assertEqual(1, cache.evictions)
+
+    def test_the_capacity_is_never_exceeded(self) -> None:
+        cache = ResidencyCache(32)
+        for index in range(10):
+            cache.put(f"entry{index}", torch.zeros(4))
+        self.assertLessEqual(cache.resident_bytes, 32)
+
+
+class StoreResidencyTests(unittest.TestCase):
+    def test_a_second_read_is_served_without_touching_storage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = DiskParameterStore(directory, residency_bytes=4096)
+            original = torch.randn(6, 3)
+            store.write("block.weight", original)
+            first = store.read("block.weight", torch.device("cpu"))
+            reads_after_first = store.reads
+            bytes_after_first = store.read_bytes
+            second = store.read("block.weight", torch.device("cpu"))
+            self.assertTrue(torch.equal(original, second))
+            self.assertIs(first, second)
+            self.assertEqual(reads_after_first, store.reads)
+            self.assertEqual(bytes_after_first, store.read_bytes)
+            self.assertEqual(1, store.residency.hits)
+
+    def test_writing_invalidates_the_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = DiskParameterStore(directory, residency_bytes=4096)
+            store.write("block.weight", torch.zeros(4))
+            store.read("block.weight", torch.device("cpu"))
+            store.write("block.weight", torch.ones(4))
+            recovered = store.read("block.weight", torch.device("cpu"))
+            self.assertTrue(torch.equal(torch.ones(4), recovered))
+
+    def test_a_store_without_residency_reads_every_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = DiskParameterStore(directory)
+            store.write("block.weight", torch.zeros(4))
+            store.read("block.weight", torch.device("cpu"))
+            store.read("block.weight", torch.device("cpu"))
+            self.assertEqual(2, store.reads)
+            self.assertEqual(0, store.residency.hits)
+
+
+class ResidentDiskOffloadTests(unittest.TestCase):
+    def test_residency_keeps_logits_bit_exact_and_cuts_reads(self) -> None:
+        model = build_model()
+        with torch.no_grad():
+            expected = model(INPUT_IDS).logits.clone()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        plan = plan_placement(traffic_of(model), TierBudget(accelerator_bytes=0, host_bytes=0))
+        with tempfile.TemporaryDirectory() as directory:
+            store = DiskParameterStore(directory, residency_bytes=8 * 1024 * 1024)
+            engine = OffloadEngine(model, plan, "cpu", store)
+            engine.attach()
+            try:
+                with torch.no_grad():
+                    model(INPUT_IDS)
+                    measured = model(INPUT_IDS).logits
+                self.assertTrue(torch.equal(expected, measured))
+                statistics = engine.refresh_statistics()
+                self.assertGreater(statistics.residency_hits, 0)
+                self.assertLessEqual(statistics.disk_read_bytes, plan.bytes_by_tier()[DISK_TIER])
+            finally:
+                engine.detach()

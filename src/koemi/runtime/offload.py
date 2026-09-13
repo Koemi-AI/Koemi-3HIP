@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -101,6 +102,9 @@ class OffloadStatistics:
     disk_materializations: int = 0
     disk_read_bytes: int = 0
     disk_read_seconds: float = 0.0
+    residency_hits: int = 0
+    residency_evictions: int = 0
+    resident_bytes: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -110,6 +114,9 @@ class OffloadStatistics:
             "disk_materializations": self.disk_materializations,
             "disk_read_bytes": self.disk_read_bytes,
             "disk_read_seconds": self.disk_read_seconds,
+            "residency_hits": self.residency_hits,
+            "residency_evictions": self.residency_evictions,
+            "resident_bytes": self.resident_bytes,
         }
 
 
@@ -212,6 +219,11 @@ class OffloadRequest:
     accelerator_bytes: int | None = None
     host_bytes: int | None = None
     store_directory: str | None = None
+    residency_bytes: int = 0
+
+    def __post_init__(self) -> None:
+        if self.residency_bytes < 0:
+            raise ValueError("residency_bytes must be non-negative")
 
     @property
     def requested(self) -> bool:
@@ -225,10 +237,45 @@ class OffloadRequest:
         return TierBudget(accelerator_bytes=self.accelerator_bytes, host_bytes=self.host_bytes)
 
 
+class ResidencyCache:
+    def __init__(self, capacity_bytes: int) -> None:
+        if capacity_bytes < 0:
+            raise ValueError("a residency capacity must be non-negative")
+        self.capacity_bytes = capacity_bytes
+        self.entries: OrderedDict[str, Tensor] = OrderedDict()
+        self.resident_bytes = 0
+        self.hits = 0
+        self.evictions = 0
+
+    def get(self, name: str) -> Tensor | None:
+        tensor = self.entries.get(name)
+        if tensor is None:
+            return None
+        self.entries.move_to_end(name)
+        self.hits += 1
+        return tensor
+
+    def put(self, name: str, tensor: Tensor) -> None:
+        size = tensor.numel() * tensor.element_size()
+        if size > self.capacity_bytes:
+            return
+        while self.entries and self.resident_bytes + size > self.capacity_bytes:
+            _, evicted = self.entries.popitem(last=False)
+            self.resident_bytes -= evicted.numel() * evicted.element_size()
+            self.evictions += 1
+        self.entries[name] = tensor
+        self.resident_bytes += size
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.resident_bytes = 0
+
+
 class DiskParameterStore:
-    def __init__(self, directory: str | Path) -> None:
+    def __init__(self, directory: str | Path, residency_bytes: int = 0) -> None:
         self.directory = Path(directory).expanduser().resolve()
         self.directory.mkdir(parents=True, exist_ok=True)
+        self.residency = ResidencyCache(residency_bytes)
         self.read_bytes = 0
         self.read_seconds = 0.0
         self.reads = 0
@@ -244,13 +291,18 @@ class DiskParameterStore:
 
     def write(self, name: str, tensor: Tensor) -> None:
         torch.save(tensor.detach().to("cpu").clone(), self.path_for(name))
+        self.residency.clear()
 
     def read(self, name: str, device: torch.device) -> Tensor:
+        cached = self.residency.get(name)
+        if cached is not None:
+            return cached
         start = time.perf_counter()
         tensor = self.restore(name, device)
         self.read_seconds += time.perf_counter() - start
         self.read_bytes += tensor.numel() * tensor.element_size()
         self.reads += 1
+        self.residency.put(name, tensor)
         return tensor
 
     def restore(self, name: str, device: torch.device) -> Tensor:
@@ -385,6 +437,9 @@ class OffloadEngine:
         if self.store is not None:
             self.statistics.disk_read_bytes = self.store.read_bytes
             self.statistics.disk_read_seconds = self.store.read_seconds
+            self.statistics.residency_hits = self.store.residency.hits
+            self.statistics.residency_evictions = self.store.residency.evictions
+            self.statistics.resident_bytes = self.store.residency.resident_bytes
         return self.statistics
 
 
@@ -396,7 +451,11 @@ def prepare_offload(
 ) -> OffloadEngine:
     traffic = calibrate_traffic(model, run_forward)
     plan = plan_placement(traffic, request.budget())
-    store = DiskParameterStore(request.store_directory) if request.store_directory else None
+    store = (
+        DiskParameterStore(request.store_directory, request.residency_bytes)
+        if request.store_directory
+        else None
+    )
     if plan.names_by_tier(DISK_TIER) and store is None:
         raise OffloadError(
             "the budget pushed modules to the disk tier, so --offload-store is required"

@@ -228,11 +228,23 @@ and parameter named in the error. That restriction is the honest one: a weight t
 optimizer updates cannot be thrown away after every forward. It also describes the
 case it is built for, a finetune over a frozen base, and inference.
 
-Disk offload buys memory with time, and the log says how much. Generating six
-bytes from a 211,888-byte model with every module on the disk tier performed 329
-materializations, read 1,311,532 bytes and spent 1.39 s inside those reads. That
-is 6.2 times the parameter footprint read back from storage. Use the disk tier
-when the model does not fit, not to make it faster.
+Disk offload buys memory with time, and the log says how much.
+`--offload-residency-mib` puts a bounded read cache in front of the store, evicting
+by least recent use, and turns the repeated reads into one read per parameter.
+
+Generating 24 bytes from a 111,024-byte model with every module on the disk tier:
+
+| Residency budget | Store reads | Bytes read | Seconds in reads | Cache hits |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 MiB | 925 | 3,778,900 | 2.1926 | 0 |
+| 1 MiB | 921 | 110,896 | 0.2017 | 892 |
+
+Without the cache the run read 34 times the parameter footprint. With 1 MiB it read
+each parameter once: 34.1 times fewer bytes and 10.9 times less time inside reads.
+The cache lives in host memory, so the budget is the memory you are trading back
+for speed; leave it at zero when the point is to hold nothing resident.
+
+Use the disk tier when the model does not fit, not to make it faster.
 
 Every run logs `offload_plan` with the bytes and module count per tier and the
 materialization counters, so a plan can be checked against the machine it ran on.
@@ -251,6 +263,7 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--offload-accelerator-mib` | unlimited | Parameter budget kept on the compute device. |
 | `--offload-host-mib` | unlimited | Parameter budget streamed from host memory. |
 | `--offload-store` | none | Directory for parameters evicted to storage. |
+| `--offload-residency-mib` | `0` | Read cache in front of the offload store. |
 | `--system` | none | System text placed before the user text at inference. |
 | `--prompt-target` | `answer` | `answer` or `thinking`: which span the model continues. |
 | `--raw-prompt` | off | Send `--prompt` verbatim, without the role markers. |
