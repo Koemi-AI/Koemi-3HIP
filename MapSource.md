@@ -1188,6 +1188,8 @@ weights.
 - Local verification after this block: `.koemi-venv\\Scripts\\python.exe -m
   unittest discover -s tests` passed 149 tests with one CUDA skip; compileall
   passed and the notebook JSON plus every non-magic code cell compiled.
+- Follow-up fix `71ad078`: the Colab setup now runs `pip install -e .` so the
+  `src/koemi` package is importable before notebook cells execute.
 
 ## Suspicion zone
 
