@@ -96,7 +96,7 @@ class PlacementPlan:
 @dataclass
 class OffloadStatistics:
     bytes_by_tier: dict[str, int] = field(default_factory=dict)
-    host_materializations: int = 0
+    host_borrows: int = 0
     host_transferred_bytes: int = 0
     disk_materializations: int = 0
     disk_read_bytes: int = 0
@@ -105,7 +105,7 @@ class OffloadStatistics:
     def to_dict(self) -> dict[str, object]:
         return {
             "bytes_by_tier": dict(self.bytes_by_tier),
-            "host_materializations": self.host_materializations,
+            "host_borrows": self.host_borrows,
             "host_transferred_bytes": self.host_transferred_bytes,
             "disk_materializations": self.disk_materializations,
             "disk_read_bytes": self.disk_read_bytes,
@@ -359,13 +359,19 @@ class OffloadEngine:
                 materialized = self.store.read(stored, self.compute_device)
                 self.statistics.disk_materializations += 1
             else:
-                materialized = parameter.to(self.compute_device)
-                self.statistics.host_materializations += 1
-                self.statistics.host_transferred_bytes += parameter.numel() * parameter.element_size()
+                materialized = self.lend_to_device(parameter)
+                self.statistics.host_borrows += 1
             held.append((module, parameter_name, parameter))
             del module._parameters[parameter_name]
             setattr(module, parameter_name, materialized)
         self.borrowed[name] = held
+
+    def lend_to_device(self, parameter: nn.Parameter) -> Tensor:
+        moved = parameter.to(self.compute_device)
+        if moved is parameter:
+            return parameter.view_as(parameter)
+        self.statistics.host_transferred_bytes += parameter.numel() * parameter.element_size()
+        return moved
 
     def restore_parameters(self, name: str, module: nn.Module) -> None:
         held = self.borrowed.pop(name, None)

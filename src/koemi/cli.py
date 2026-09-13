@@ -156,7 +156,7 @@ def log_offload(engine: OffloadEngine, logger) -> None:
     logger.info(
         "offload_plan accelerator_bytes=%s host_bytes=%s disk_bytes=%s "
         "accelerator_modules=%s host_modules=%s disk_modules=%s "
-        "host_materializations=%s host_transferred_bytes=%s "
+        "host_borrows=%s host_transferred_bytes=%s "
         "disk_materializations=%s disk_read_bytes=%s disk_read_seconds=%.4f",
         statistics.bytes_by_tier[ACCELERATOR_TIER],
         statistics.bytes_by_tier[HOST_TIER],
@@ -164,7 +164,7 @@ def log_offload(engine: OffloadEngine, logger) -> None:
         len(engine.plan.names_by_tier(ACCELERATOR_TIER)),
         len(engine.plan.names_by_tier(HOST_TIER)),
         len(engine.plan.names_by_tier(DISK_TIER)),
-        statistics.host_materializations,
+        statistics.host_borrows,
         statistics.host_transferred_bytes,
         statistics.disk_materializations,
         statistics.disk_read_bytes,

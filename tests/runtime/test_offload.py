@@ -178,9 +178,48 @@ class OffloadEquivalenceTests(unittest.TestCase):
             with torch.no_grad():
                 measured = model(INPUT_IDS).logits
             self.assertTrue(torch.equal(expected, measured))
-            self.assertGreater(engine.statistics.host_materializations, 0)
+            self.assertGreater(engine.statistics.host_borrows, 0)
         finally:
             engine.detach()
+
+    def test_host_tier_counts_no_transfer_when_the_device_already_matches(self) -> None:
+        model = build_model()
+        plan = plan_placement(traffic_of(model), TierBudget(accelerator_bytes=0))
+        engine = OffloadEngine(model, plan, "cpu")
+        engine.attach()
+        try:
+            with torch.no_grad():
+                model(INPUT_IDS)
+        finally:
+            engine.detach()
+        self.assertGreater(engine.statistics.host_borrows, 0)
+        self.assertEqual(0, engine.statistics.host_transferred_bytes)
+
+    def test_a_borrowed_parameter_leaves_the_registry_during_the_forward(self) -> None:
+        model = build_model()
+        plan = plan_placement(traffic_of(model), TierBudget(accelerator_bytes=0))
+        engine = OffloadEngine(model, plan, "cpu")
+        engine.attach()
+        observed: list[tuple[bool, bool]] = []
+
+        def spy(module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
+            observed.append(
+                (
+                    "weight" in module._parameters,
+                    isinstance(module.__dict__.get("weight"), torch.Tensor),
+                )
+            )
+
+        handle = model.token_predictor.register_forward_pre_hook(spy)
+        try:
+            with torch.no_grad():
+                model(INPUT_IDS)
+        finally:
+            handle.remove()
+            engine.detach()
+        self.assertTrue(observed)
+        self.assertEqual([(False, True)], list(set(observed)))
+        self.assertIn("weight", model.token_predictor._parameters)
 
     def test_host_tier_offload_keeps_gradients_bit_exact(self) -> None:
         reference = build_model()
