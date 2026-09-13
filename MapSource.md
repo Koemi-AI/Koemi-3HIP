@@ -1190,6 +1190,9 @@ weights.
   passed and the notebook JSON plus every non-magic code cell compiled.
 - Follow-up fix `71ad078`: the Colab setup now runs `pip install -e .` so the
   `src/koemi` package is importable before notebook cells execute.
+- Follow-up fix `0ee5317`: imports now prepend `/content/Koemi-3HIP/src`
+  directly to `sys.path`; the notebook no longer depends on editable-install
+  resolution in Colab.
 
 ## Suspicion zone
 
