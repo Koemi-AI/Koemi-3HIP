@@ -468,6 +468,19 @@ hours, resumes from checkpoints, and exports loss/BPB, perplexity, throughput,
 GPU memory, surprise and expert-load evidence. The dataset card is the source of
 the license and corpus claims: https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk.
 
+For a nine-hour Colab Pro A100 run, use
+[`notebooks/Koemi-3HIP_A100.ipynb`](notebooks/Koemi-3HIP_A100.ipynb). The notebook
+pins the Koemi-3HIP source revision, runs local contract tests before downloading
+data, mounts Google Drive for resumable rotating checkpoints, and calibrates the
+microbatch against the detected A100. Its default 0.205B-parameter configuration
+uses BF16 autocast, TF32 matmuls, 128 deterministic experts with 6 active per
+token, and a 64-example effective batch. The corpus builder keeps verified
+English coding records from OpenCodeInstruct, CodeFeedback, and Magicoder, then
+adds Math-Verify-complete OpenR1 traces with separate thinking and answer loss.
+Terminal-Bench and BigCodeBench remain evaluation-only and are not downloaded by
+the training cell. Dataset revisions, quotas, checkpoint format, and known limits
+are recorded in [`docs/A100_CODE_REASONING_TRAINING.md`](docs/A100_CODE_REASONING_TRAINING.md).
+
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json

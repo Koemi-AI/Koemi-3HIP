@@ -1,7 +1,7 @@
 ---
 prumo_protocol: "2.0.0"
 schema: 2
-updated_at: 2026-09-13
+updated_at: 2026-09-14
 ---
 
 # MapSource - Koemi-3HIP
@@ -48,6 +48,9 @@ com baselines ainda precisam ser fechados.
 - Frente 2026-09-13: ledger persistente de estados por prefixo, read associativo
   sem o intermediario `[B,L,d,m]`, partida com confianca limitada, buffer exato
   causal de saliencia, hash MoE independente de posicao e refine fora do default.
+- Frente A100: notebook de treino monogpu com corpus ingles de programacao e
+  matematica verificada, revisoes de dataset fixadas, materializacao auditavel,
+  BF16/TF32 e retomada em dois slots atomicos no Drive.
 
 ### Out of scope
 
@@ -61,6 +64,9 @@ com baselines ainda precisam ser fechados.
 - Memoria episodica compartilhada entre usuarios ou armazenamento deliberado de PII.
 - Alegar ganho em T4, tensor cores ou FP16 sem execucao em hardware CUDA.
 - Mudar `memory_features` para 4 sem ablacao de qualidade saturada em tres seeds.
+- Prometer que uma sessao Colab, um compilador ou um dataset remoto nunca falhara.
+- Treinar ou executar Terminal-Bench e BigCodeBench: sao avaliacao, nao corpus,
+  e os artefatos de terminal podem conter ambientes executaveis nao confiaveis.
 
 ### Acceptance criteria
 
@@ -89,6 +95,10 @@ com baselines ainda precisam ser fechados.
 - [x] O hash MoE independe da posicao absoluta e o default nao executa refine.
 - [x] Suite, smoke de geracao e benchmark CPU passam; README registra apenas
   numeros medidos nesta maquina.
+- [ ] Notebook A100 rejeita linhas remotas fora do contrato, fixa as revisoes e
+  materializa o corpus com manifesto e hash antes do treino longo.
+- [ ] Notebook A100 passa os testes internos de recuperacao de checkpoint e a
+  preflight CUDA de paralelismo, BF16, VRAM e lote real antes de treinar.
 
 ### Assumptions
 
@@ -102,6 +112,9 @@ com baselines ainda precisam ser fechados.
 - "Corrigir cada um" cobre os itens 1 a 6 do diagnostico de 2026-09-13.
 - Checkpoints antigos permanecem carregaveis quando a mudanca nao exige estado
   novo; qualquer quebra inevitavel sera declarada antes do commit.
+- O objetivo da frente A100 e um assistente de programacao em ingles com
+  raciocinio matematico supervisionado de forma visivel; isso nao e uma alegacao
+  de cognicao geral nem uma garantia de qualidade sem medicao CUDA.
 
 ## Architecture map
 
@@ -137,6 +150,8 @@ flowchart LR
 - `src/koemi/training/dataset.py` - causal chunks and thinking masks.
 - `src/koemi/training/objective.py` - causal and thinking-weighted loss.
 - `src/koemi/training/trainer.py` - optimizer, metrics and logs.
+- `src/koemi/training/a100_run.py` - pinned corpus, A100 preflight, calibration,
+  BF16 loop, metrics and rotating Drive checkpoints.
 - `src/koemi/training/checkpoints.py` - weights-only checkpoint contract.
 - `src/koemi/training/generation.py` - longest-prefix resume and stateful generation.
 - `src/koemi/observability/report.py` - self-validating standard run report.
@@ -154,6 +169,12 @@ flowchart LR
 - `src/koemi/model/cache.py` - finite cache ownership, prefix hash chain and instrumentation.
 - `src/koemi/training/dataset.py` - `thinking_mask` propagation.
 - `src/koemi/training/objective.py` - weighted token cross entropy.
+- `src/koemi/training/a100_run.py` - source adapters, corpus manifest, batch
+  sampler, CUDA preflight, checkpoint payload and overnight session contract.
+- `notebooks/Koemi-3HIP_A100.ipynb` - self-contained Colab setup, embedded
+  runner, internal tests and nine-hour A100 invocation.
+- `docs/A100_CODE_REASONING_TRAINING.md` - research-backed corpus and runtime
+  decisions, licenses, exclusions and limitations.
 
 ## Decisions
 
@@ -516,6 +537,9 @@ weights.
   `4b4e548`.
 - [x] Correcao dos seis gargalos HERM de 2026-09-13, branch `main`; implementada
   e verificada localmente, com qualidade CUDA e saliencia ainda sem ablacao.
+- [x] Notebook A100 code-and-reasoning, branch `main`; especificacao em
+  `docs/A100_CODE_REASONING_TRAINING.md`, runner, notebook e testes locais
+  implementados; preflight CUDA e corpus remoto continuam pendentes.
 
 ## Suspicion zone
 
@@ -744,6 +768,23 @@ weights.
   CPU sweep measures its cost but does not establish a quality gain.
 - Proposed fix: compare capacity and threshold at an equal saturated budget over
   three seeds on a detail-recall task before claiming benefit or retuning defaults.
+
+### KOEMI-021 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/training/a100_run.py`, `notebooks/Koemi-3HIP_A100.ipynb`
+- Condition: a long A100 run can consume credits while a remote schema, dataset
+  revision, Drive write, dynamic batch shape or CUDA path is unverified.
+- Impact: an invalid corpus, unrecoverable checkpoint or unsupported execution
+  path could waste a material part of the bounded Colab budget.
+- Evidence: the local host is CPU-only; the A100 notebook and runner are
+  statically checked and their mocked contracts pass, but the real data/Drive/
+  A100 path has never completed in this environment.
+- Proposed fix: source-specific mocked tests, immutable source revisions,
+  atomic two-slot checkpoints, an A100 preflight and a measured batch calibration
+  before the long loop. Keep `torch.compile` disabled until it proves equivalent
+  and faster on this exact workload.
 
 ## Resolved suspicions
 
@@ -1243,9 +1284,9 @@ weights.
   the remaining balance for validation, report export and generation. Promote to
   `d=768` only when emitted supervised-tokens/s and peak-memory measurements show
   adequate data coverage and runtime cost.
-- No A100 runtime has been executed. The notebook remains a T4-oriented
-  reproducibility harness; its logged `tokens_per_second` must be used to size
-  any second run.
+- No A100 runtime has been executed locally. The new notebook is A100-oriented
+  and its logged `supervised_tokens_per_second` plus peak VRAM must be used to
+  size any second run; the older five-hour notebook remains T4-oriented.
 
 ## Suspicion zone
 
@@ -1255,3 +1296,22 @@ weights.
   traffic even when aggregate counts look acceptable; severity: medium; action:
   report entropy, min/max and Gini in the overnight notebook before claiming
   quality or specialization.
+
+### 2026-09-14 - A100 code-and-reasoning notebook
+
+- Added `src/koemi/training/a100_run.py` and embedded the same source in
+  `notebooks/Koemi-3HIP_A100.ipynb`. The runner pins four Hub revisions, filters
+  verified code/math rows, excludes Terminal-Bench and BigCodeBench, materializes
+  a SHA-256 corpus, and uses the repository's causal byte/thinking contracts.
+- The default model is `embedding_size=512`, `128 experts`, `top_k=6`,
+  `scan_chunk=128`, `ablation=no_refine`: 204,816,147 parameters. The notebook
+  enables BF16/TF32, calibrates a real A100 batch, trains for exactly nine hours,
+  writes JSONL metrics, and rotates two atomic Drive checkpoints every 15 minutes.
+- Added source-adapter, filtered-chunk, sampler-resume, checkpoint-recovery,
+  full-payload and notebook-compile tests. The local command
+  `.koemi-venv\\Scripts\\python.exe -m unittest discover -s tests -p 'test*.py'`
+  passed 158 tests with one expected CUDA skip. `compileall`, `git diff --check`,
+  notebook cell compilation and exact embedded-source parity also pass.
+- Acceptance remains open for the actual Colab A100 preflight, remote streaming
+  downloads and nine-hour CUDA session; this CPU-only host cannot claim those
+  results. The notebook stops before training if any of those checks fail.
