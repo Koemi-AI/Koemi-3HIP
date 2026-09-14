@@ -1219,6 +1219,27 @@ weights.
   cells compiled, `compileall` passed, and the full suite passed 149 tests with
   one CUDA skip. Actual CUDA/Drive/dataset execution remains a Colab-only gate.
 
+### 2026-09-13 - A100 budget assessment for the overnight notebook
+
+- Local `HEAD` and `origin/main` were both `94ab988145889279599ae12299b31a508847cbbd`;
+  the assessment is for the published Koemi-3HIP notebook, not a stale local copy.
+- The current `d=128`, `128 experts`, `top_k=6` configuration has 12,914,835
+  trainable parameters. Direct counts at widths 64, 128 and 256 verified the
+  no-refine parameter formula `779d^2 + 1183d + 275`; a 384-wide run would be
+  115,322,771 parameters and activates 7,150,739 parameters per byte position.
+- A nominal 1B configuration is `d=1132` (999,568,727 parameters), but it still
+  activates 60,875,839 parameters per byte and creates at least an 11.17 GiB
+  model-plus-Adam checkpoint before activations and CUDA allocator overhead.
+  Six A100 hours cannot establish a useful 1B from-scratch language model on
+  this corpus; it is a data- and measured-throughput-limited experiment.
+- Recommendation for the first CUDA measurement: use `d=384` (0.115B total),
+  retain the notebook's 5-hour training limit, and keep the remaining A100 time
+  for validation, report export and generation. Promote to `d=512` only when the
+  emitted supervised-tokens/s and peak-memory measurements show adequate budget.
+- No A100 runtime has been executed. The notebook remains a T4-oriented
+  reproducibility harness; its logged `tokens_per_second` must be used to size
+  any second run.
+
 ## Suspicion zone
 
 - **KOEMI-020** — `src/koemi/model/experts.py:59-73` — condition: the six
