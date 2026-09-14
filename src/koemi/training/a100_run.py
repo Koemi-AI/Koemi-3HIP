@@ -567,7 +567,18 @@ def load_streaming_dataset(dataset_name: str, revision: str, config_name: str | 
         from datasets import load_dataset
     except ModuleNotFoundError as error:
         raise RuntimeError("install datasets==3.6.0 before running the A100 trainer") from error
-    dataset = load_dataset(dataset_name, name=config_name, split="train", streaming=True, revision=revision)
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            dataset = load_dataset(dataset_name, name=config_name, split="train", streaming=True, revision=revision)
+            break
+        except Exception as error:
+            last_error = error
+            if "429" not in str(error) or attempt == 4:
+                raise
+            time.sleep(2 ** attempt)
+    else:
+        raise RuntimeError(f"unable to load {dataset_name} after Hugging Face retries") from last_error
     return dataset.shuffle(seed=seed, buffer_size=buffer_size)
 
 
@@ -584,6 +595,7 @@ def collect_source_records(
     source_name: str,
 ) -> tuple[list[DatasetRecord], dict[str, Any]]:
     records: list[DatasetRecord] = []
+    seen_identifiers: set[str] = set()
     rejections: Counter[str] = Counter()
     scanned = 0
     for raw_row in stream:
@@ -594,9 +606,15 @@ def collect_source_records(
             rejections["SourceRowRejected: row is not an object"] += 1
             continue
         try:
-            records.append(adapter(raw_row, str(scanned - 1)))
+            record = adapter(raw_row, str(scanned - 1))
         except (DatasetValidationError, SourceRowRejected, TypeError, ValueError, json.JSONDecodeError) as error:
             rejections[rejection_key(error)] += 1
+            continue
+        if record.identifier in seen_identifiers:
+            rejections["SourceRowRejected: duplicate record identifier"] += 1
+            continue
+        seen_identifiers.add(record.identifier)
+        records.append(record)
         if len(records) == target_count:
             return records, {"source": source_name, "selected": len(records), "scanned": scanned, "rejections": dict(rejections)}
     raise RuntimeError(
@@ -607,6 +625,7 @@ def collect_source_records(
 def collect_opencode_records(stream, quotas: CorpusQuotas, scan_limit: int) -> tuple[list[DatasetRecord], dict[str, Any]]:
     priority_records: list[DatasetRecord] = []
     general_records: list[DatasetRecord] = []
+    seen_identifiers: set[str] = set()
     rejections: Counter[str] = Counter()
     scanned = 0
     for raw_row in stream:
@@ -621,6 +640,10 @@ def collect_opencode_records(stream, quotas: CorpusQuotas, scan_limit: int) -> t
         except (DatasetValidationError, SourceRowRejected, TypeError, ValueError, json.JSONDecodeError) as error:
             rejections[rejection_key(error)] += 1
             continue
+        if record.identifier in seen_identifiers:
+            rejections["SourceRowRejected: duplicate record identifier"] += 1
+            continue
+        seen_identifiers.add(record.identifier)
         if is_priority_code_record(record) and len(priority_records) < quotas.opencode_priority:
             priority_records.append(record)
         elif len(general_records) < quotas.opencode_general:
@@ -786,7 +809,13 @@ def build_or_load_corpus(configuration: RunConfiguration) -> tuple[list[DatasetR
     records = opencode_records + codefeedback_records + magicoder_records + math_records
     identifiers = [record.identifier for record in records]
     if len(identifiers) != len(set(identifiers)):
-        raise DatasetValidationError("selected corpus contains duplicate record identifiers")
+        duplicate_identifiers = sorted(
+            identifier for identifier, count in Counter(identifiers).items() if count > 1
+        )
+        raise DatasetValidationError(
+            "selected corpus contains duplicate record identifiers: "
+            + ", ".join(duplicate_identifiers[:10])
+        )
     write_corpus(corpus_path, records)
     manifest = {
         "requested_contract": requested_contract,

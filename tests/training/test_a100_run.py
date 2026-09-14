@@ -19,6 +19,7 @@ from koemi.training.a100_run import (
     adapt_openr1_math_row,
     build_or_load_corpus,
     collate_materialized_chunks,
+    collect_source_records,
     CorpusQuotas,
     RunConfiguration,
     parse_arguments,
@@ -82,6 +83,16 @@ class A100RunTests(unittest.TestCase):
                 },
                 "fallback",
             )
+
+    def test_source_collection_skips_duplicate_identifiers(self) -> None:
+        rows = [{"id": "same", "input": "first", "output": "answer"}, {"id": "same", "input": "second", "output": "answer"}, {"id": "new", "input": "third", "output": "answer"}]
+
+        def adapter(row, _fallback_identifier):
+            return DatasetRecord(f"source:{row['id']}", row["input"], None, row["output"], {})
+
+        records, report = collect_source_records(iter(rows), 2, 3, adapter, "test-source")
+        self.assertEqual(["source:same", "source:new"], [record.identifier for record in records])
+        self.assertEqual(1, report["rejections"]["SourceRowRejected: duplicate record identifier"])
 
     def test_materialized_dataset_matches_repository_chunk_and_target_contract(self) -> None:
         records = (

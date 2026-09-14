@@ -786,6 +786,22 @@ weights.
   before the long loop. Keep `torch.compile` disabled until it proves equivalent
   and faster on this exact workload.
 
+### KOEMI-022 #risk/high
+
+- Severity: high
+- Status: closed
+- Location: `src/koemi/training/a100_run.py:596-660`, `notebooks/Koemi-3HIP_A100.ipynb`
+- Condition: Hugging Face source streams can repeat an upstream identifier, causing
+  corpus construction to abort after downloading data with `selected corpus contains
+  duplicate record identifiers`.
+- Impact: a Colab session spent on Hub downloads stopped before training and could
+  waste the user's bounded compute budget.
+- Evidence: the user's A100 notebook run reproduced the failure; the local duplicate
+  stream regression test now passes.
+- Proposed fix: reject duplicate identifiers while collecting each source, count the
+  rejection in the source report, and continue scanning until the quota is filled;
+  the embedded notebook runner is synchronized with the module.
+
 ## Resolved suspicions
 
 ### KOEMI-008 #risk/medium
@@ -1315,3 +1331,12 @@ weights.
 - Acceptance remains open for the actual Colab A100 preflight, remote streaming
   downloads and nine-hour CUDA session; this CPU-only host cannot claim those
   results. The notebook stops before training if any of those checks fail.
+
+### 2026-09-14 - Hub duplicate-ID recovery
+
+- A real Colab run reached corpus selection but failed on a repeated upstream
+  identifier. Source collection now skips duplicates deterministically and records
+  the count; Hugging Face 429 loads also retry with bounded exponential backoff.
+- Added a regression test for duplicate source identifiers and synchronized the
+  embedded A100 runner. Targeted tests and notebook parity pass locally; the remote
+  Hub retry and full A100 run remain unverified on this CPU-only host.
