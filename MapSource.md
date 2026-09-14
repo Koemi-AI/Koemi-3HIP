@@ -1227,15 +1227,22 @@ weights.
   trainable parameters. Direct counts at widths 64, 128 and 256 verified the
   no-refine parameter formula `779d^2 + 1183d + 275`; a 384-wide run would be
   115,322,771 parameters and activates 7,150,739 parameters per byte position.
+- The user reported 200 Colab compute units at about 6.77 units per A100 hour,
+  which is 29.54 A100 hours while that rate remains unchanged. This corrects the
+  earlier mistaken six-hour budget. Colab Pro does not guarantee one continuous
+  29-hour VM, so the notebook must resume from Drive checkpoints across bounded
+  sessions.
 - A nominal 1B configuration is `d=1132` (999,568,727 parameters), but it still
   activates 60,875,839 parameters per byte and creates at least an 11.17 GiB
   model-plus-Adam checkpoint before activations and CUDA allocator overhead.
-  Six A100 hours cannot establish a useful 1B from-scratch language model on
-  this corpus; it is a data- and measured-throughput-limited experiment.
-- Recommendation for the first CUDA measurement: use `d=384` (0.115B total),
-  retain the notebook's 5-hour training limit, and keep the remaining A100 time
-  for validation, report export and generation. Promote to `d=512` only when the
-  emitted supervised-tokens/s and peak-memory measurements show adequate budget.
+  Thirty A100 hours can run this configuration, but cannot establish a useful
+  1B from-scratch language model on this corpus without throughput and data-scale
+  evidence.
+- Recommendation for the first long CUDA run: use `d=512` (0.205B total), split
+  the approximately 28-hour training budget into resumable sessions, and reserve
+  the remaining balance for validation, report export and generation. Promote to
+  `d=768` only when emitted supervised-tokens/s and peak-memory measurements show
+  adequate data coverage and runtime cost.
 - No A100 runtime has been executed. The notebook remains a T4-oriented
   reproducibility harness; its logged `tokens_per_second` must be used to size
   any second run.
