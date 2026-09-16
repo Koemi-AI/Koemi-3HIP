@@ -595,6 +595,21 @@ delivered because this host has no CUDA runtime to execute or profile it. A
 native fused implementation is a later replacement behind this boundary only
 if the target profile proves the launch/allocation overhead is material.
 
+### D-030 - Field audit gates optimization by measured bottleneck
+
+The 2026-09-16 field audit separates verified source facts from performance
+hypotheses. The first implementation order is: profile a real CUDA target;
+remove host synchronizations and avoidable allocations; stabilize expert,
+window and batch shapes; replace the causal `C^2` materialization only when
+the profile confirms it; then implement a fused CUDA operator with CPU
+fallback, forward/backward equivalence and `opcheck`. Titans, MIRAS, RNNs and
+SSMs are comparison and ablation families, not drop-in optimizations for the
+existing HERM memory.
+
+Rejected alternative: writing a native kernel or a device driver before a
+CUDA profile. A driver is the wrong layer, and a blind kernel can increase
+build, numerical and maintenance risk without improving end-to-end training.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -975,6 +990,72 @@ if the target profile proves the launch/allocation overhead is material.
 - Proposed fix: add an integration harness with cancellation, deadline,
   exception, backpressure, stream dependency and graceful-close cases before
   connecting these seams to generation or training.
+
+### KOEMI-029 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/model/memory.py:97-144`
+- Condition: causal associative reads materialize pairwise influence with a
+  `[B,C,C]` structure inside each chunk.
+- Impact: work and temporary memory can grow approximately with
+  `B*C^2*(d+memory_features)`, limiting chunk size and dominating prefill.
+- Evidence: convergent read-only audit by three independent fronts on
+  2026-09-16; no CUDA profile has measured its share of end-to-end time.
+- Proposed fix: benchmark the current path against a tiled/microblock path
+  that carries only the state between blocks, then require causal and gradient
+  equivalence before replacing the implementation.
+
+### KOEMI-030 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/model/scan.py:17-32`, `src/koemi/model/cuda_scan.py:169-213`
+- Condition: affine scan uses Python-controlled stages, concatenations and
+  temporary tensors; the CUDA seam is still composed of PyTorch operations,
+  not a native `.cu` or compiled operator.
+- Impact: repeated launches and allocations may erase GPU parallelism, while
+  the CPU-only host prevents confirming the actual cost or numerical behavior
+  on NVIDIA hardware.
+- Evidence: source audit and local runtime `torch 2.14.0+cpu` with
+  `torch.cuda.is_available() == false` on 2026-09-16.
+- Proposed fix: preserve the current scan as oracle, profile it on the target,
+  then add a fused operator with CPU fallback, backward coverage and
+  forward/state/gradient equivalence tests.
+
+### KOEMI-031 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/experts.py:45-73`
+- Condition: expert dispatch still relies on Python iteration, `nonzero`,
+  indexed selection and accumulation, despite the static batched dispatch
+  intent recorded in `D-013`.
+- Impact: dynamic dispatch can cause graph breaks, irregular memory traffic and
+  poor GPU utilization; the decision and implementation may have drifted.
+- Evidence: source audit on 2026-09-16; no CUDA profiler or end-to-end dispatch
+  comparison was run in this audit.
+- Proposed fix: revalidate `D-013` against the current code, implement one
+  batched candidate only behind equivalence tests, and keep it opt-in until
+  forward-plus-backward timing proves a win.
+
+### KOEMI-032 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/runtime/inference_batching.py:467-518`,
+  `src/koemi/runtime/batching_mode.py:123-139`
+- Condition: the scheduler limits raw token totals while emitted batches are
+  padded to the longest request, and the batching plan is not integrated into
+  the trainer or model execution path.
+- Impact: `max_batch_tokens` can understate actual work and memory, while the
+  advertised BatchingMode/BulkMode seams currently add no measured throughput
+  or latency benefit by themselves.
+- Evidence: source audit on 2026-09-16; only isolated contract tests exist and
+  no integrated CUDA execution was measured.
+- Proposed fix: enforce a padded-token budget, add length buckets and an
+  integration harness for queue, cancellation, state ownership and shutdown;
+  accept only measured p50/p95 and throughput improvement.
 
 ## Resolved suspicions
 
@@ -1544,3 +1625,28 @@ if the target profile proves the launch/allocation overhead is material.
   uses explicit JSON/bytes and integrity checks, but its SSD payloads are not
   encrypted; GPU validation, host-sync removal in context summary/index paths,
   and integration lifecycle remain open under KOEMI-023 through KOEMI-028.
+
+### 2026-09-16 - GPU, memory and runtime field audit
+
+- Three read-only subagents independently audited the repository and returned
+  convergent findings. No source file, test or runtime contract was changed by
+  this audit; all agents were closed after their reports were reviewed.
+- The shared priority is P0 host-sync and allocation removal; P1 static-shape
+  windows, batched expert dispatch, tiled associative reads and a fused scan;
+  P2 integrated length buckets, pinned H2D, stream/event overlap and exact
+  prefix/block reuse. Every optimization remains a hypothesis until measured
+  end to end on CUDA.
+- Titans is a neural memory updated by test-time optimization; MIRAS is a
+  design framework spanning memory architecture, retention and update rule.
+  HERM's rank-one gated associative memory is related but not equivalent, so
+  Titans/MIRAS/RNN/SSM replacements require quality and cost ablations.
+- Primary references reviewed: Titans
+  (`https://arxiv.org/html/2501.00663`), MIRAS
+  (`https://arxiv.org/html/2504.13173`), Mamba
+  (`https://arxiv.org/html/2312.00752v2`), PyTorch custom operators
+  (`https://docs.pytorch.org/tutorials/advanced/cpp_custom_ops.html`) and
+  NVIDIA asynchronous execution
+  (`https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html`).
+- Verification boundary is unchanged: local `torch 2.14.0+cpu` has no CUDA
+  device, so no CUDA speedup, overlap, native-kernel advantage, GPU memory
+  result or context-quality improvement was measured in this block.
