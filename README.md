@@ -348,6 +348,24 @@ affine, so `remainder(expert_count)` saw only the low bits: with consecutive byt
 where the previous byte is one less than the current one, it reached 1 expert of 4
 and 16 of 64. The mixing form reaches 4 of 4 and 63 of 64.
 
+## Experimental optimization fronts
+
+The repository also contains ten opt-in optimization seams in
+[`docs/HERM_OPTIMIZATION_LAB.md`](docs/HERM_OPTIMIZATION_LAB.md). They remain
+outside the default `KoemiModel` and trainer until hardware and quality gates
+are measured:
+
+| Front | Current contract | Boundary |
+| --- | --- | --- |
+| CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | PyTorch CUDA ops are implemented; no native `.cu` kernel or local CUDA timing |
+| Context | Multi-rate summary, exact prefix index, causal bounded admission | Summary is lossy; exact stores never perform semantic reuse |
+| Batching and bulk | Length-aware training plan, inference scheduler, exact RAM/SSD blocks, bounded async enqueue | Callers still execute the model and own integration; no end-to-end throughput claim |
+
+The local verification is CPU-only: the complete suite passes with conditional
+CUDA skips. This front records contracts and measurements to collect; it does
+not claim that a GPU, CPU thread, RAM cache or SSD will overlap usefully for
+every workload.
+
 ## Parameter offload
 
 Offload moves parameters off the compute device by how much arithmetic their
@@ -537,6 +555,10 @@ confidence gate or salient ring.
 - UTF-8 byte tokenization uses more positions than a learned tokenizer.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.
+- The optimization lab provides opt-in CUDA, context and batching seams, but
+  they are not wired into the default model or trainer. This CPU-only host has
+  not measured CUDA overlap, native kernel speed, end-to-end batching gain or
+  context quality; exact SSD block payloads are not encrypted.
 
 ## Project layout
 
@@ -544,9 +566,9 @@ confidence gate or salient ring.
 src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization and tokenizer
-  model/          HERM state, memory, cache, scan and deterministic MoE
-  runtime/        parameter offload: traffic calibration, tiers, disk store
-  training/       Causal chunks, objective, trainer, checkpoint and generation
+  model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
+  runtime/        parameter offload, inference batching, bulk blocks and async enqueue
+  training/       Causal chunks, objective, trainer, batching plan, checkpoint and generation
 benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs

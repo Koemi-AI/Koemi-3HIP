@@ -1,7 +1,7 @@
 ---
 prumo_protocol: "2.0.0"
 schema: 2
-updated_at: 2026-09-14
+updated_at: 2026-09-16
 ---
 
 # MapSource - Koemi-3HIP
@@ -51,13 +51,18 @@ com baselines ainda precisam ser fechados.
 - Frente A100: notebook de treino monogpu com corpus ingles de programacao e
   matematica verificada, revisoes de dataset fixadas, materializacao auditavel,
   BF16/TF32 e retomada em dois slots atomicos no Drive.
+- Frente de otimizacao experimental: seams opt-in para scan CUDA por operacoes
+  PyTorch, buffers de estado, politica de precisao, resumo/indexacao de contexto,
+  selecao causal, batching de treino/inferencia, blocos exatos RAM/SSD e enqueue
+  assincrono limitado; o caminho default permanece inalterado.
 
 ### Out of scope
 
 - Garantir memoria infinita ou ausencia total de esquecimento.
 - Provar superioridade sobre GRU, LSTM, Mamba ou Transformers sem medicao.
 - Saturar GPU, CPU, RAM e SSD simultaneamente sem necessidade medida.
-- Treino distribuido, kernel Triton, tokenizer aprendido ou deployment.
+- Treino distribuido, kernel Triton ou kernel CUDA nativo integrado, tokenizer
+  aprendido ou deployment.
 - MoE com capacity factor e descarte de token: o dispatch e dropless por decisao,
   porque o limite de capacidade existe para limitar o all-to-all de MoE
   distribuido e este treinador roda em um dispositivo.
@@ -99,6 +104,16 @@ com baselines ainda precisam ser fechados.
   materializa o corpus com manifesto e hash antes do treino longo.
 - [ ] Notebook A100 passa os testes internos de recuperacao de checkpoint e a
   preflight CUDA de paralelismo, BF16, VRAM e lote real antes de treinar.
+- [x] Dez seams de otimizacao permanecem opt-in, tem contratos delimitados e
+  testes locais; nenhum altera o forward default ou promete ganho de GPU.
+- [ ] Scan CUDA, AMP, streams, buffers, batching e overlap CPU/GPU passam a
+  execucao real em GPU, com equivalencia de forward/backward e perfil
+  end-to-end antes de qualquer integracao default.
+- [ ] ContextSummary, ContextIndex, ContextPolicy e BulkBlockStore passam
+  ablacao de recall/qualidade em no minimo tres seeds, com taxa de falso reuse
+  zero para blocos exatos e politica de criptografia SSD decidida.
+- [ ] BatchingMode e os schedulers passam integracao real com trainer/generation,
+  sem perda de ordem, estado, mascara, deadlines ou isolamento entre requests.
 
 ### Assumptions
 
@@ -145,15 +160,31 @@ flowchart LR
 - `src/koemi/model/memory.py` - recurrent, rank-one associative, local and salient states.
 - `src/koemi/model/scan.py` - affine scan and previous-state operations.
 - `src/koemi/model/cache.py` - bounded token, exact mapping and prefix-state caches.
+- `src/koemi/model/cuda_scan.py` - CUDA-only affine scan backend seam using
+  PyTorch tensor operations; native kernel remains out of scope.
+- `src/koemi/model/gpu_memory.py` - reusable fixed-layout CPU/CUDA state buffers.
+- `src/koemi/model/gpu_precision.py` - device-safe AMP/TF32 policy and FP32 probes.
+- `src/koemi/model/context_summary.py` - bounded multi-rate EMA summary and
+  confidence read.
+- `src/koemi/model/context_index.py` - exact namespace-aware prefix index.
+- `src/koemi/model/context_policy.py` - bounded causal surprise/recency/novelty
+  admission policy.
 - `src/koemi/model/experts.py` - stacked expert bank, hash and learned dispatch.
 - `src/koemi/model/network.py` - Koemi-3HIP forward paths.
 - `src/koemi/training/dataset.py` - causal chunks and thinking masks.
 - `src/koemi/training/objective.py` - causal and thinking-weighted loss.
 - `src/koemi/training/trainer.py` - optimizer, metrics and logs.
+- `src/koemi/training/batching_mode.py` - length-aware microbatch plan and
+  gradient-accumulation boundaries.
 - `src/koemi/training/a100_run.py` - pinned corpus, A100 preflight, calibration,
   BF16 loop, metrics and rotating Drive checkpoints.
 - `src/koemi/training/checkpoints.py` - weights-only checkpoint contract.
 - `src/koemi/training/generation.py` - longest-prefix resume and stateful generation.
+- `src/koemi/runtime/inference_batching.py` - compatible request queues, padded
+  batches, deadlines and result handles.
+- `src/koemi/runtime/bulk_blocks.py` - exact fixed-token RAM/SSD block store.
+- `src/koemi/runtime/bulk_executor.py` - bounded CPU preparation and optional CUDA
+  stream/event enqueue.
 - `src/koemi/observability/report.py` - self-validating standard run report.
 - `src/koemi/observability/resources.py` - peak memory probe per device.
 - `benchmarks/run_benchmark.py` - three-model harness emitting the standard report.
@@ -167,6 +198,17 @@ flowchart LR
 - `src/koemi/model/experts.py` - `ExpertBank`, `ExpertRouter`,
   `RouterStatistics`, `merge_router_statistics` e `ExpertMixture.combine`.
 - `src/koemi/model/cache.py` - finite cache ownership, prefix hash chain and instrumentation.
+- `src/koemi/model/cuda_scan.py` - CUDA affine scan contract and synchronized
+  diagnostic boundary; this is not a native custom kernel.
+- `src/koemi/model/gpu_memory.py` and `src/koemi/model/gpu_precision.py` -
+  reusable state storage, device precision selection and FP32 comparison probes.
+- `src/koemi/model/context_summary.py`, `context_index.py` and `context_policy.py`
+  - bounded lossy summary, exact prefix identity and causal admission policy.
+- `src/koemi/training/batching_mode.py` - deterministic length bucketing and
+  padded-token accounting without materializing samples.
+- `src/koemi/runtime/inference_batching.py`, `bulk_blocks.py` and
+  `bulk_executor.py` - request batching, exact RAM/SSD blocks and bounded async
+  preparation/enqueue seams; none executes the model implicitly.
 - `src/koemi/training/dataset.py` - `thinking_mask` propagation.
 - `src/koemi/training/objective.py` - weighted token cross entropy.
 - `src/koemi/training/a100_run.py` - source adapters, corpus manifest, batch
@@ -520,6 +562,39 @@ Adding the fourth fusion input changes learned weight dimensions, so checkpoint
 format 7 refuses formats 5 and 6 instead of partially loading incompatible
 weights.
 
+### D-026 - Optimization seams remain opt-in until end-to-end proof
+
+The CUDA, buffer, precision, context and batching modules are separate contracts
+and do not alter `KoemiModel` or `Trainer` by import alone. A seam can enter the
+default path only after forward/backward equivalence, quality checks and a
+measured end-to-end win include its staging, padding, launch and synchronization
+costs. This keeps a plausible microbenchmark from becoming a regression in the
+real training loop.
+
+### D-027 - Bulk blocks are exact, bounded and namespace-scoped
+
+`BulkBlockStore` accepts fixed token blocks, carries a digest chain and requires
+full sequence validation before releasing a payload. RAM and SSD capacities,
+TTL, namespace identity and explicit serialization are mandatory. It never
+interprets similar prompts as equivalent, and its local SSD payloads are not
+encrypted until key ownership and a protection policy are defined.
+
+### D-028 - CPU/GPU overlap is dependency-driven
+
+`BulkExecutor` exposes bounded CPU preparation and optional CUDA stream/event
+enqueue. It does not promise “extreme async” or overlap SSD, host and device for
+every workload. Pinned host memory, non-blocking copies and explicit stream
+dependencies must be measured on the target GPU; a thread pool alone is not a
+GPU optimization.
+
+### D-029 - The current CUDA scan is a backend seam, not a native kernel
+
+`cuda_affine_scan` uses PyTorch tensor operations on CUDA and retains the
+sequential chunk-carry contract. No `.cu`, Triton or compiled extension was
+delivered because this host has no CUDA runtime to execute or profile it. A
+native fused implementation is a later replacement behind this boundary only
+if the target profile proves the launch/allocation overhead is material.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -540,6 +615,12 @@ weights.
 - [x] Notebook A100 code-and-reasoning, branch `main`; especificacao em
   `docs/A100_CODE_REASONING_TRAINING.md`, runner, notebook e testes locais
   implementados; preflight CUDA e corpus remoto continuam pendentes.
+- [x] Frente de otimizacao HERM, 2026-09-16: tres seams GPU/CUDA, tres seams
+  de contexto e quatro seams Batching/Bulk implementados de forma opt-in, com
+  contratos e testes locais; nenhum foi integrado ao caminho default.
+- [ ] Frente de otimizacao HERM: executar CUDA real, medir forward/backward,
+  streams, VRAM, padding, fila, hit-rate e throughput end-to-end em hardware
+  alvo antes de promover qualquer seam.
 
 ## Suspicion zone
 
@@ -802,6 +883,99 @@ weights.
   rejection in the source report, and continue scanning until the quota is filled;
   the embedded notebook runner is synchronized with the module.
 
+### KOEMI-023 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/model/cuda_scan.py:45`, `gpu_memory.py:45`,
+  `gpu_precision.py:97`, `src/koemi/runtime/bulk_executor.py:96`
+- Condition: the new CUDA, AMP, stream and event paths have contract tests but
+  this environment has no CUDA runtime or device.
+- Impact: numerical equivalence, kernel launch cost, allocator behavior, stream
+  ordering and actual CPU/GPU overlap remain unknown; a regression could appear
+  only during a paid A100/T4 run.
+- Evidence: local PyTorch is `2.14.0+cpu`, `torch.cuda.is_available()` is false,
+  and the CUDA tests are conditional skips.
+- Proposed fix: run the full CUDA contract on the target GPU, compare FP32 and
+  AMP forward/backward against the sequential oracle, and capture tokens/s,
+  p50/p95 latency, peak VRAM and transfer bytes before integration.
+
+### KOEMI-024 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/context_summary.py:175-207`, `:297-334`
+- Condition: empty-read detection and state/value validation use
+  `.detach().cpu().item()` on the current implementation.
+- Impact: an opt-in GPU summary update or read can force host scalar
+  synchronization and erase the latency benefit of a short memory path.
+- Evidence: source audit on 2026-09-16; the default HERM path does not construct
+  `ContextSummary`.
+- Proposed fix: keep serialization and diagnostics at the host boundary, then
+  replace hot-path scalar checks with a supported asynchronous/device-side
+  validation strategy and measure the resulting error behavior on CUDA.
+
+### KOEMI-025 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/context_index.py:32-44`
+- Condition: tensor sequences passed to the CPU exact-prefix index are detached,
+  copied to CPU and converted to Python lists.
+- Impact: passing GPU token IDs to the index can introduce a device-to-host copy
+  and synchronization before a lookup, making a cache check more expensive than
+  the suffix it intends to skip.
+- Evidence: source audit on 2026-09-16; the index is intentionally CPU-side and
+  only CPU tensor execution was tested.
+- Proposed fix: require CPU sequences at this boundary or hash on the caller's
+  device and pass a validated digest, then compare end-to-end lookup cost.
+
+### KOEMI-026 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/context_policy.py:195-465`, `:634-635`
+- Condition: admission loops over candidates and fixed capacity and uses the
+  private `torch._assert_async` API for finite-input checks.
+- Impact: large candidate/capacity settings can create launch and memory costs,
+  while a PyTorch compatibility change can break the validation path.
+- Evidence: CPU tests cover causal, bounded and deterministic behavior; no CUDA
+  profile or supported-API compatibility matrix exists.
+- Proposed fix: keep capacity bounded, profile the real candidate distribution,
+  replace private APIs only after a supported device-side assertion is selected,
+  and retain a CPU regression for each failure contract.
+
+### KOEMI-027 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/runtime/bulk_blocks.py:308-313`
+- Condition: exact BulkMode blocks can persist prompt-derived state on SSD with
+  integrity checks but without encryption.
+- Impact: local disk access can expose user prompts, recurrent state or logits;
+  a digest detects corruption but does not provide confidentiality.
+- Evidence: the module documents the limitation and its SSD tests use explicit
+  temporary directories; no key-management or encrypted-at-rest contract exists.
+- Proposed fix: choose a key owner and authenticated encryption format before
+  enabling persistent prompt-derived blocks; until then keep the tier opt-in and
+  private, with retention and deletion tests.
+
+### KOEMI-028 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/runtime/inference_batching.py:315-387`,
+  `bulk_executor.py:339-369`
+- Condition: batching and bulk seams expose caller-owned completion, cancellation
+  and stream waits rather than owning model execution and lifecycle shutdown.
+- Impact: an integration can leak active batches, return late state, deadlock on
+  backpressure or close a stream before a consumer reads it.
+- Evidence: isolated lifecycle tests pass, but no integration test connects the
+  scheduler, HERM forward, state cache and shutdown path.
+- Proposed fix: add an integration harness with cancellation, deadline,
+  exception, backpressure, stream dependency and graceful-close cases before
+  connecting these seams to generation or training.
+
 ## Resolved suspicions
 
 ### KOEMI-008 #risk/medium
@@ -945,6 +1119,8 @@ weights.
 - `.koemi-venv/Scripts/python.exe -m koemi generate --checkpoint artifacts/koemi-3hip.pt --prompt "FIFO means"`
 - `.koemi-venv/Scripts/python.exe benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-schema.json`
 - `.koemi-venv/Scripts/python.exe benchmarks/run_ablation.py --task recall --seeds 17 29 41 --report artifacts/ablation-recall-schema.json`
+- `.koemi-venv/Scripts/python.exe -m unittest discover -s tests -p 'test*.py'`
+- `.koemi-venv/Scripts/python.exe -m compileall -q src benchmarks tests`
 - `koemi train --report PATH --validation-fraction 0.1` writes the standard schema.
 
 ## Glossary
@@ -955,6 +1131,12 @@ weights.
 - `fixed-dispatch MoE`: expert bank selected by deterministic token hash, no router.
 - `warm cache`: bounded embedding cache reused by an explicit inference caller.
 - `scan oracle`: sequential execution used to verify the parallel affine scan.
+- `BatchingMode`: deterministic length-aware microbatch planning without sample copies.
+- `BulkMode`: bounded exact block storage plus asynchronous preparation/enqueue seams.
+- `GPU-first`: keep tensor work on the accelerator when measured, with explicit
+  CPU staging and dependency ordering rather than implicit copies.
+- `prefix block`: fixed token sequence and bounded state identified by an exact
+  namespace-scoped digest; it is not a semantic match.
 
 ## Verification status
 
@@ -1340,3 +1522,25 @@ weights.
 - Added a regression test for duplicate source identifiers and synchronized the
   embedded A100 runner. Targeted tests and notebook parity pass locally; the remote
   Hub retry and full A100 run remain unverified on this CPU-only host.
+
+### 2026-09-16 - HERM optimization lab
+
+- Spawned three GPU/CUDA fronts, waited for all three, then spawned three context
+  fronts; after those six completed, spawned four Batching/Bulk fronts. Their
+  write sets are isolated under `src/koemi/model/`, `src/koemi/training/` and
+  `src/koemi/runtime/`, with matching tests.
+- Added opt-in contracts for a PyTorch CUDA affine-scan backend, reusable state
+  buffers, device precision/FP32 comparison, multi-rate context summaries,
+  exact prefix indexing, causal context admission, length-aware training plans,
+  compatible inference queues, exact RAM/SSD blocks and bounded async enqueue.
+- `.koemi-venv\Scripts\python.exe -m compileall -q src benchmarks tests`: PASS.
+  The focused six-seam suite passed 63 tests with 11 conditional CUDA skips.
+  The complete suite passed 271 tests with 13 conditional CUDA skips.
+- The local runtime is Python 3.13.14 with `torch 2.14.0+cpu` and
+  `torch.cuda.is_available() == false`; no A100/T4 execution, CUDA timing,
+  native `.cu` kernel, end-to-end batching gain, context recall ablation or
+  quality improvement is claimed.
+- The default `KoemiModel`/`Trainer` path was not changed. The exact block store
+  uses explicit JSON/bytes and integrity checks, but its SSD payloads are not
+  encrypted; GPU validation, host-sync removal in context summary/index paths,
+  and integration lifecycle remain open under KOEMI-023 through KOEMI-028.
