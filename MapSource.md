@@ -610,6 +610,24 @@ Rejected alternative: writing a native kernel or a device driver before a
 CUDA profile. A driver is the wrong layer, and a blind kernel can increase
 build, numerical and maintenance risk without improving end-to-end training.
 
+### D-031 - HERM wins the cost contest; Titans is the capacity hypothesis
+
+There is no honest universal winner without a matched benchmark. MIRAS is a
+design framework, not a single model; Titans is one concrete family built with
+neural long-term memory, a short-term core and persistent memory. HERM's
+bounded rank-one associative memory is cheaper and easier to keep causal,
+state-limited and GPU-fusable, while Titans has the stronger hypothesis for
+expressive long-context memorization because its memory is a deeper online
+optimized module.
+
+The working prediction is therefore: HERM wins equal-latency, low-cost
+training and implementation maturity; Titans likely wins memory capacity and
+long-context recall when extra compute and a matched quality budget are
+allowed. The recommended product path is to keep HERM as the baseline and
+ablate MIRAS-inspired retention, objective and update choices rather than
+replace it blindly. No superiority claim is valid until both models share
+parameters, tokens, data, seeds, hardware, training budget and recall tests.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
