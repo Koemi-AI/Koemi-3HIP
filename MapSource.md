@@ -628,20 +628,22 @@ ablate MIRAS-inspired retention, objective and update choices rather than
 replace it blindly. No superiority claim is valid until both models share
 parameters, tokens, data, seeds, hardware, training budget and recall tests.
 
-### D-032 - Colab is a worker, not an exposed kernel
+### D-032 - Official Colab MCP is a local browser bridge
 
-The 2026-09-16 integration check found no native Google Colab MCP endpoint or
-Colab runtime connector available in this session. A Google Drive connector
-can expose notebook files but cannot control a live GPU runtime. If agent
-control is needed, the supported design is a narrow authenticated MCP gateway
-with allowlisted operations, while Colab runs as a worker that reports status,
-metrics and artifacts. A persistent gateway is preferred over a direct tunnel
-to an ephemeral notebook runtime.
+The 2026-09-16 check confirms that `googlecolab/colab-mcp` is an official
+Google Colaboratory repository: it is owned by the `googlecolab` organization,
+listed in that organization's pinned repositories, has Google-authored source
+and uses the Apache-2.0 license. It runs as a local MCP server/proxy and bridges
+a local agent to a Colab session in the browser over a localhost WebSocket. The
+upstream README lists Gemini CLI, Claude Code and Windsurf and requires
+`notifications/tools/list_changed`; compatibility with this Codex session is
+not verified and it is not currently connected here.
 
 Rejected alternative: exposing a public notebook endpoint that evaluates
-arbitrary Python or shell commands. It would turn a connector credential into
-remote code execution over the training filesystem and could spend Colab
-credits or leak model data.
+arbitrary Python or shell commands. The official local bridge is the safer
+integration boundary; a public tunnel would turn notebook control into remote
+code execution over the training filesystem and could spend Colab credits or
+leak model data.
 
 ## Work fronts
 
@@ -1094,20 +1096,23 @@ credits or leak model data.
 
 - Severity: high
 - Status: open
-- Location: `notebooks/Koemi-3HIP_A100.ipynb:1`
-- Condition: connecting a live Colab runtime through a tunnel or MCP server
-  would expose training data, checkpoints, filesystem access and compute
-  control unless the notebook side is constrained by an explicit tool
-  allowlist and authenticated job boundary.
+- Location: `external: colab-mcp/src/colab_mcp/websocket_server.py:33-96`,
+  `external: colab-mcp/src/colab_mcp/session.py:150-186`,
+  `notebooks/Koemi-3HIP_A100.ipynb:1`
+- Condition: the official local bridge unlocks notebook editing and runtime
+  tools after the browser session connects; an untrusted MCP client or exposed
+  local port would grant access to training data, checkpoints, filesystem and
+  compute control.
 - Impact: unauthorized code execution, credential or model-data disclosure,
   cross-session state access and uncontrolled consumption of Colab credits.
-- Evidence: the repository has no Colab MCP gateway contract; the current
-  integration search found only a file-oriented Google Drive connector, not a
-  live Colab runtime connector.
-- Proposed fix: expose only preflight, start-job, status, metrics, artifact and
-  stop-job operations; use short-lived authentication, request/job IDs,
-  quotas, audit logs and no arbitrary `eval`/shell tool. Prefer a persistent
-  gateway with an outbound Colab worker.
+- Evidence: the bridge binds a localhost WebSocket, restricts origins to Colab
+  domains and generates a random proxy token; its browser-connection tool then
+  unlocks notebook editing tools. No `colab-mcp` server is connected to this
+  Codex session.
+- Proposed fix: keep the bridge local and unexposed, review its tool surface,
+  test only with a disposable/safe notebook, use Colab Secrets for credentials,
+  cap jobs and credits, and never place arbitrary shell/eval access or secrets
+  in the notebook integration.
 
 ## Resolved suspicions
 
