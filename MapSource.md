@@ -1086,8 +1086,10 @@ leak model data.
 - Impact: `max_batch_tokens` can understate actual work and memory, while the
   advertised BatchingMode/BulkMode seams currently add no measured throughput
   or latency benefit by themselves.
-- Evidence: source audit on 2026-09-16; only isolated contract tests exist and
-  no integrated CUDA execution was measured.
+- Evidence: source audit on 2026-09-16 found no production references from
+  `KoemiModel`, trainer or generation into `BulkBlockStore` or `BulkExecutor`;
+  the executor explicitly does not execute a model. Only isolated contract
+  tests exist and no integrated CUDA execution was measured.
 - Proposed fix: enforce a padded-token budget, add length buckets and an
   integration harness for queue, cancellation, state ownership and shutdown;
   accept only measured p50/p95 and throughput improvement.
