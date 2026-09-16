@@ -1,3 +1,4 @@
+from koemi.runtime.bulk_prefix_cache import BulkPrefixCache
 from koemi.runtime.offload import (
     ACCELERATOR_TIER,
     DISK_TIER,
@@ -18,6 +19,7 @@ from koemi.runtime.offload import (
 )
 
 __all__ = [
+    "BulkPrefixCache",
     "ACCELERATOR_TIER",
     "DISK_TIER",
     "HOST_TIER",

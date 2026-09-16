@@ -16,6 +16,7 @@ from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
 from koemi.observability.logging import configure_logging
+from koemi.runtime.bulk_prefix_cache import BulkPrefixCache
 from koemi.runtime.offload import (
     ACCELERATOR_TIER,
     DISK_TIER,
@@ -106,6 +107,17 @@ def create_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--mapping-cache-namespace", default=None)
     generate_parser.add_argument("--mapping-cache-ttl-seconds", type=float, default=3600.0)
     generate_parser.add_argument("--clear-mapping-cache", action="store_true")
+    generate_parser.add_argument(
+        "--bulk-prefix-cache",
+        default=None,
+        help="Optional RAM/SSD block cache for exact generation prefixes",
+    )
+    generate_parser.add_argument("--bulk-prefix-cache-namespace", default=None)
+    generate_parser.add_argument("--bulk-prefix-cache-block-size", type=int, default=None)
+    generate_parser.add_argument("--bulk-prefix-cache-ram-capacity", type=int, default=128)
+    generate_parser.add_argument("--bulk-prefix-cache-disk-capacity", type=int, default=128)
+    generate_parser.add_argument("--bulk-prefix-cache-max-entry-mib", type=int, default=64)
+    generate_parser.add_argument("--bulk-prefix-cache-ttl-seconds", type=float, default=3600.0)
     add_offload_arguments(generate_parser)
     return parser
 
@@ -346,8 +358,12 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     loaded_checkpoint = CheckpointStore().load(arguments.checkpoint, arguments.device)
     cache_capacity = arguments.cache_capacity or loaded_checkpoint.model_settings.cache_capacity
     warm_cache = WarmTokenCache(cache_capacity)
+    if arguments.mapping_cache is not None and arguments.bulk_prefix_cache is not None:
+        raise ValueError("--mapping-cache and --bulk-prefix-cache are mutually exclusive")
     if arguments.mapping_cache is not None and not arguments.mapping_cache_namespace:
         raise ValueError("--mapping-cache-namespace is required with --mapping-cache")
+    if arguments.bulk_prefix_cache is not None and not arguments.bulk_prefix_cache_namespace:
+        raise ValueError("--bulk-prefix-cache-namespace is required with --bulk-prefix-cache")
     mapping_cache = (
         DiskMappingCache(
             arguments.mapping_cache,
@@ -357,6 +373,23 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
             ttl_seconds=arguments.mapping_cache_ttl_seconds,
         )
         if arguments.mapping_cache is not None
+        else None
+    )
+    bulk_prefix_cache = (
+        BulkPrefixCache(
+            arguments.bulk_prefix_cache,
+            namespace=f"{arguments.bulk_prefix_cache_namespace}:{checkpoint_namespace(arguments.checkpoint)}",
+            block_size=(
+                loaded_checkpoint.model_settings.scan_chunk
+                if arguments.bulk_prefix_cache_block_size is None
+                else arguments.bulk_prefix_cache_block_size
+            ),
+            ram_capacity=arguments.bulk_prefix_cache_ram_capacity,
+            disk_capacity=arguments.bulk_prefix_cache_disk_capacity,
+            max_entry_bytes=arguments.bulk_prefix_cache_max_entry_mib * 1024 * 1024,
+            ttl_seconds=arguments.bulk_prefix_cache_ttl_seconds,
+        )
+        if arguments.bulk_prefix_cache is not None
         else None
     )
     if mapping_cache is not None and arguments.clear_mapping_cache:
@@ -374,6 +407,7 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
             arguments.device,
             warm_cache,
             mapping_cache,
+            bulk_prefix_cache,
         )
     finally:
         if engine is not None:
@@ -383,10 +417,13 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         completion = strip_prompt(completion, prompt)
     statistics = warm_cache.statistics()
     mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
+    bulk_statistics = bulk_prefix_cache.statistics() if bulk_prefix_cache is not None else None
     logger.info(
         "generation_completed generated_bytes=%s cache_hits=%s cache_misses=%s cache_evictions=%s "
         "mapping_hits=%s mapping_misses=%s mapping_evictions=%s mapping_expirations=%s mapping_deletions=%s "
-        "prefix_hits=%s prefix_misses=%s prefix_tokens_reused=%s",
+        "prefix_hits=%s prefix_misses=%s prefix_tokens_reused=%s "
+        "bulk_block_hits=%s bulk_block_misses=%s bulk_ram_hits=%s bulk_disk_hits=%s "
+        "bulk_evictions=%s bulk_expirations=%s",
         len(completion.encode("utf-8")),
         statistics.hits,
         statistics.misses,
@@ -399,6 +436,12 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         mapping_statistics.prefix_hits if mapping_statistics else 0,
         mapping_statistics.prefix_misses if mapping_statistics else 0,
         mapping_statistics.prefix_tokens_reused if mapping_statistics else 0,
+        bulk_statistics.hits if bulk_statistics else 0,
+        bulk_statistics.misses if bulk_statistics else 0,
+        bulk_statistics.ram_hits if bulk_statistics else 0,
+        bulk_statistics.disk_hits if bulk_statistics else 0,
+        bulk_statistics.evictions if bulk_statistics else 0,
+        bulk_statistics.expirations if bulk_statistics else 0,
     )
     write_utf8(completion)
     return 0

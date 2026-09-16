@@ -2,8 +2,9 @@
 
 Status: experimental and opt-in. The current machine has `torch 2.14.0+cpu`
 and no CUDA device. The modules below define bounded seams and executable
-contracts; they do not establish a GPU speedup, a memory-quality improvement,
-or a production integration.
+contracts; `BulkPrefixCache` is connected to generation when explicitly
+selected, but the repository still has no measured GPU speedup, memory-quality
+improvement or end-to-end batching integration.
 
 ## Verdict
 
@@ -25,10 +26,11 @@ profile identifies as dominant.
 | Context admission | `koemi.model.context_policy` | Causal bounded selection by surprise, recency and novelty | Opt-in; bounded but `O(batch × candidates × capacity)` |
 | Training batch | `koemi.training.batching_mode` | Length buckets, padded-token budget, stable permutation and accumulation boundaries | Plan-only; trainer and collation are unchanged |
 | Inference batch | `koemi.runtime.inference_batching` | Contract-compatible FIFO queues, padding, deadlines and request handles | Scheduler-only; caller executes and completes the model batch |
-| Exact blocks | `koemi.runtime.bulk_blocks` | RAM/SSD fixed-token blocks with digest, TTL, capacity and full-sequence validation | Functional contract; SSD payloads are integrity-checked, not encrypted |
+| Exact blocks | `koemi.runtime.bulk_blocks` + `koemi.runtime.bulk_prefix_cache` | RAM/SSD fixed-token blocks with digest, TTL, capacity and validated prefix-state restore | `BulkPrefixCache` is connected to generation; SSD payloads are integrity-checked, not encrypted |
 | Async bulk | `koemi.runtime.bulk_executor` | Bounded CPU preparation plus optional CUDA stream/event enqueue | Pipeline seam; it does not execute a model or promise overlap |
 
-All ten seams are separate from the default forward path. The exact context and
+Nine seams remain separate from the default forward path. `BulkPrefixCache` is
+connected to generation only when explicitly selected. The exact context and
 bulk stores reject fuzzy reuse: a cache hit must identify the namespace and
 prove the complete token sequence before a bounded state is released.
 
@@ -39,6 +41,11 @@ Before these seams, the local baseline was Python 3.13.14 with PyTorch
 conditional CUDA skip. After the six model seams, the focused suite ran 63
 tests with 11 CUDA skips. After all ten seams, the complete suite ran 271 tests
 with 13 conditional CUDA skips, and `compileall` passed.
+
+After connecting `BulkPrefixCache` to the opt-in generation path, the complete
+local suite ran 275 tests with 13 conditional CUDA skips, and `compileall`
+passed. This validates exact reuse and state restoration; it does not measure
+the cost of key hashing, SSD I/O or CUDA execution.
 
 The result is contract verification, not performance evidence. No A100/T4
 execution, CUDA kernel timing, GPU memory profile, end-to-end batch throughput,
@@ -81,9 +88,10 @@ memory object:
 1. `ContextSummary` compresses recent observations into a fixed number of
    exponential time scales. Evidence and confidence bound the read; it is a
    lossy summary, not a claim of exact recall.
-2. `ContextIndex` and `BulkBlockStore` identify exact prefixes or fixed token
-   blocks. They can skip a repeated prefix and run only its suffix, but they
-   cannot infer that two similar questions are equivalent.
+2. `ContextIndex`, `BulkBlockStore` and `BulkPrefixCache` identify exact prefixes
+   or fixed token blocks. `BulkPrefixCache` restores the bounded state at the
+   end of the longest complete block and runs only its suffix, but it cannot
+   infer that two similar questions are equivalent.
 3. `ContextPolicy` admits a bounded set of causal candidates using scores that
    are already available. It never consults future positions and does not
    replace HERM's recurrent state transition.
@@ -132,9 +140,11 @@ For host-loader overlap, use the [PyTorch performance tuning guide](https://docs
 For compilation, check [torch.compile](https://docs.pytorch.org/docs/stable/generated/torch.compile.html)
 and [CUDA Graph constraints](https://docs.pytorch.org/docs/main/notes/cuda.html#constraints).
 
-## Acceptance gate before integration
+## Acceptance gate before default promotion
 
-The seams should be integrated into HERM only after all of these are measured:
+Opt-in seams may expose an explicit caller boundary, as `BulkPrefixCache` does
+for generation. Promotion into the default HERM path still requires all of
+these measurements:
 
 - CUDA execution on the target GPU passes forward, backward and state
   equivalence against the sequential scan oracle for FP32 and the selected AMP
@@ -167,5 +177,5 @@ The seams should be integrated into HERM only after all of these are measured:
 5. Only then prototype a native fused scan or CUDA Graph capture for the exact
    static bucket that the profile selects.
 
-Until that gate is closed, “GPU-first”, “BulkMode” and “Jenga memory” describe
-design directions and opt-in contracts, not measured product capabilities.
+Until that gate is closed, “GPU-first”, `BulkPrefixCache` and “Jenga memory” are
+opt-in product paths or design directions, not measured performance capabilities.

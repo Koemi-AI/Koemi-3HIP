@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from koemi.cli import main, write_utf8
+from koemi.cli import create_parser, main, write_utf8
 
 
 CANONICAL_RECORD = {
@@ -29,6 +29,27 @@ class CliOutputTests(unittest.TestCase):
 
 
 class CliCommandTests(unittest.TestCase):
+    def test_generate_parser_accepts_bulk_prefix_cache_arguments(self) -> None:
+        arguments = create_parser().parse_args(
+            [
+                "generate",
+                "--checkpoint",
+                "model.pt",
+                "--prompt",
+                "hello",
+                "--bulk-prefix-cache",
+                "cache",
+                "--bulk-prefix-cache-namespace",
+                "test",
+                "--bulk-prefix-cache-block-size",
+                "32",
+            ]
+        )
+
+        self.assertEqual("cache", arguments.bulk_prefix_cache)
+        self.assertEqual("test", arguments.bulk_prefix_cache_namespace)
+        self.assertEqual(32, arguments.bulk_prefix_cache_block_size)
+
     def test_trains_and_generates_with_koemi_3hip_flags(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory)
@@ -77,6 +98,30 @@ class CliCommandTests(unittest.TestCase):
                 )
             self.assertEqual(0, generate_status)
             self.assertTrue(output.getvalue().startswith(b"FIFO"))
+
+            bulk_output = io.BytesIO()
+            bulk_stdout = type("BufferedStdout", (), {"buffer": bulk_output})()
+            with patch("koemi.cli.sys.stdout", bulk_stdout):
+                bulk_generate_status = main(
+                    [
+                        "generate",
+                        "--checkpoint",
+                        str(checkpoint_path),
+                        "--prompt",
+                        "FIFO",
+                        "--max-new-bytes",
+                        "4",
+                        "--raw-prompt",
+                        "--bulk-prefix-cache",
+                        str(workspace / "bulk-prefix"),
+                        "--bulk-prefix-cache-namespace",
+                        "cli-test",
+                        "--bulk-prefix-cache-block-size",
+                        "2",
+                    ]
+                )
+            self.assertEqual(0, bulk_generate_status)
+            self.assertTrue(bulk_output.getvalue().startswith(b"FIFO"))
 
     def test_old_routing_flags_are_removed(self) -> None:
         with self.assertRaises(SystemExit):

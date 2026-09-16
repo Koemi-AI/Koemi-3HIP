@@ -106,6 +106,8 @@ com baselines ainda precisam ser fechados.
   preflight CUDA de paralelismo, BF16, VRAM e lote real antes de treinar.
 - [x] Dez seams de otimizacao permanecem opt-in, tem contratos delimitados e
   testes locais; nenhum altera o forward default ou promete ganho de GPU.
+- [x] `BulkPrefixCache` integra blocos exatos RAM/SSD a generation de forma
+  opt-in, restaura o maior prefixo completo e processa somente o sufixo.
 - [ ] Scan CUDA, AMP, streams, buffers, batching e overlap CPU/GPU passam a
   execucao real em GPU, com equivalencia de forward/backward e perfil
   end-to-end antes de qualquer integracao default.
@@ -183,6 +185,8 @@ flowchart LR
 - `src/koemi/runtime/inference_batching.py` - compatible request queues, padded
   batches, deadlines and result handles.
 - `src/koemi/runtime/bulk_blocks.py` - exact fixed-token RAM/SSD block store.
+- `src/koemi/runtime/bulk_prefix_cache.py` - exact block-backed prefix-state
+  cache connected to generation.
 - `src/koemi/runtime/bulk_executor.py` - bounded CPU preparation and optional CUDA
   stream/event enqueue.
 - `src/koemi/observability/report.py` - self-validating standard run report.
@@ -206,9 +210,11 @@ flowchart LR
   - bounded lossy summary, exact prefix identity and causal admission policy.
 - `src/koemi/training/batching_mode.py` - deterministic length bucketing and
   padded-token accounting without materializing samples.
-- `src/koemi/runtime/inference_batching.py`, `bulk_blocks.py` and
-  `bulk_executor.py` - request batching, exact RAM/SSD blocks and bounded async
-  preparation/enqueue seams; none executes the model implicitly.
+- `src/koemi/runtime/inference_batching.py`, `bulk_blocks.py`,
+  `bulk_prefix_cache.py` and `bulk_executor.py` - request batching, exact
+  RAM/SSD blocks, generation prefix reuse and bounded async preparation/enqueue;
+  only `BulkPrefixCache` is connected at the generation boundary, and none of
+  these components executes the model implicitly.
 - `src/koemi/training/dataset.py` - `thinking_mask` propagation.
 - `src/koemi/training/objective.py` - weighted token cross entropy.
 - `src/koemi/training/a100_run.py` - source adapters, corpus manifest, batch
@@ -579,6 +585,11 @@ TTL, namespace identity and explicit serialization are mandatory. It never
 interprets similar prompts as equivalent, and its local SSD payloads are not
 encrypted until key ownership and a protection policy are defined.
 
+`BulkPrefixCache` builds on that store: it saves validated recurrent state only
+at complete block boundaries and includes the digest of all preceding tokens in
+the block namespace, so an identical suffix after changed history cannot reuse
+the state.
+
 ### D-028 - CPU/GPU overlap is dependency-driven
 
 `BulkExecutor` exposes bounded CPU preparation and optional CUDA stream/event
@@ -667,7 +678,8 @@ leak model data.
   implementados; preflight CUDA e corpus remoto continuam pendentes.
 - [x] Frente de otimizacao HERM, 2026-09-16: tres seams GPU/CUDA, tres seams
   de contexto e quatro seams Batching/Bulk implementados de forma opt-in, com
-  contratos e testes locais; nenhum foi integrado ao caminho default.
+  contratos e testes locais; `BulkPrefixCache` foi integrado somente na
+  fronteira opt-in de generation e o caminho default permanece inalterado.
 - [ ] Frente de otimizacao HERM: executar CUDA real, medir forward/backward,
   streams, VRAM, padding, fila, hit-rate e throughput end-to-end em hardware
   alvo antes de promover qualquer seam.
@@ -999,8 +1011,9 @@ leak model data.
 
 - Severity: high
 - Status: open
-- Location: `src/koemi/runtime/bulk_blocks.py:308-313`
-- Condition: exact BulkMode blocks can persist prompt-derived state on SSD with
+- Location: `src/koemi/runtime/bulk_blocks.py:308-313`,
+  `src/koemi/runtime/bulk_prefix_cache.py:113-124`
+- Condition: exact `BulkPrefixCache` blocks can persist prompt-derived state on SSD with
   integrity checks but without encryption.
 - Impact: local disk access can expose user prompts, recurrent state or logits;
   a digest detects corruption but does not provide confidentiality.
@@ -1016,12 +1029,14 @@ leak model data.
 - Status: open
 - Location: `src/koemi/runtime/inference_batching.py:315-387`,
   `bulk_executor.py:339-369`
-- Condition: batching and bulk seams expose caller-owned completion, cancellation
-  and stream waits rather than owning model execution and lifecycle shutdown.
-- Impact: an integration can leak active batches, return late state, deadlock on
-  backpressure or close a stream before a consumer reads it.
-- Evidence: isolated lifecycle tests pass, but no integration test connects the
-  scheduler, HERM forward, state cache and shutdown path.
+- Condition: inference batching and async bulk seams expose caller-owned
+  completion, cancellation and stream waits rather than owning model execution
+  and lifecycle shutdown; `BulkPrefixCache` is a separate exact-prefix path.
+- Impact: a future batch integration can leak active batches, return late state,
+  deadlock on backpressure or close a stream before a consumer reads it.
+- Evidence: `BulkPrefixCache` is covered by generation and persistence tests, but
+  no integration test connects the scheduler, HERM forward, state cache and
+  shutdown path.
 - Proposed fix: add an integration harness with cancellation, deadline,
   exception, backpressure, stream dependency and graceful-close cases before
   connecting these seams to generation or training.
@@ -1082,14 +1097,15 @@ leak model data.
   `src/koemi/runtime/batching_mode.py:123-139`
 - Condition: the scheduler limits raw token totals while emitted batches are
   padded to the longest request, and the batching plan is not integrated into
-  the trainer or model execution path.
+  the trainer or model execution path; `BulkExecutor` is still not connected
+  to model execution.
 - Impact: `max_batch_tokens` can understate actual work and memory, while the
-  advertised BatchingMode/BulkMode seams currently add no measured throughput
-  or latency benefit by themselves.
-- Evidence: source audit on 2026-09-16 found no production references from
-  `KoemiModel`, trainer or generation into `BulkBlockStore` or `BulkExecutor`;
-  the executor explicitly does not execute a model. Only isolated contract
-  tests exist and no integrated CUDA execution was measured.
+  exact prefix path does not provide multi-request batching or a measured
+  throughput/latency benefit by itself.
+- Evidence: source audit on 2026-09-16 found `BulkPrefixCache` calls from
+  `generation.py` into `BulkBlockStore`; no production references connect
+  `BulkExecutor` to `KoemiModel`, trainer or generation, and the executor does
+  not execute a model. No integrated CUDA execution was measured.
 - Proposed fix: enforce a padded-token budget, add length buckets and an
   integration harness for queue, cancellation, state ownership and shutdown;
   accept only measured p50/p95 and throughput improvement.
@@ -1115,6 +1131,21 @@ leak model data.
   test only with a disposable/safe notebook, use Colab Secrets for credentials,
   cap jobs and credits, and never place arbitrary shell/eval access or secrets
   in the notebook integration.
+
+### KOEMI-034 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/runtime/bulk_prefix_cache.py:127-145`
+- Condition: every bulk lookup and write materializes the complete prompt token
+  tensor on the CPU before hashing and validating its block keys.
+- Impact: on CUDA this host synchronization and copy can consume the benefit of
+  skipping a short prefix, especially for small prompts or high request rates.
+- Evidence: `_token_ids` calls `detach().cpu().reshape(-1).tolist()`; no CUDA
+  timing or host-sync profile was available in the CPU-only verification.
+- Proposed fix: benchmark the copy/hash cost against the skipped forward work,
+  then retain host token IDs at the caller boundary or add a device-side key
+  path only if the measured workload justifies its complexity.
 
 ## Resolved suspicions
 
@@ -1272,7 +1303,10 @@ leak model data.
 - `warm cache`: bounded embedding cache reused by an explicit inference caller.
 - `scan oracle`: sequential execution used to verify the parallel affine scan.
 - `BatchingMode`: deterministic length-aware microbatch planning without sample copies.
-- `BulkMode`: bounded exact block storage plus asynchronous preparation/enqueue seams.
+- `BulkPrefixCache`: exact fixed-token prefix-state reuse at the generation
+  boundary, backed by `BulkBlockStore`; block-aligned and not semantic.
+- `BulkExecutor`: bounded CPU preparation plus optional CUDA stream/event enqueue;
+  it does not execute a model.
 - `GPU-first`: keep tensor work on the accelerator when measured, with explicit
   CPU staging and dependency ordering rather than implicit copies.
 - `prefix block`: fixed token sequence and bounded state identified by an exact
@@ -1709,3 +1743,17 @@ leak model data.
 - Verification boundary is unchanged: local `torch 2.14.0+cpu` has no CUDA
   device, so no CUDA speedup, overlap, native-kernel advantage, GPU memory
   result or context-quality improvement was measured in this block.
+
+### 2026-09-16 - BulkPrefixCache generation integration
+
+- Added `src/koemi/runtime/bulk_prefix_cache.py`, which serializes validated
+  recurrent prefix state into exact fixed-token RAM/SSD blocks. The namespace
+  includes the complete preceding token history digest, preventing a repeated
+  suffix after a changed history from becoming a false hit.
+- `src/koemi/training/generation.py` now accepts the cache explicitly and
+  evaluates only the uncached suffix. `src/koemi/cli.py` exposes the opt-in
+  `--bulk-prefix-cache` flags and rejects simultaneous mapping/bulk caches.
+- Targeted generation/CLI tests passed after exercising RAM reuse, disk restore,
+  history isolation, output/state equivalence and the real CLI path. The full
+  suite passed 275 tests with 13 conditional CUDA skips, and `compileall`
+  passed; CUDA performance remains unverified on this CPU-only host.

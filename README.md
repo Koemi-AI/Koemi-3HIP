@@ -119,13 +119,21 @@ only its suffix. Entries use an explicit tenant/session plus checkpoint namespac
 expire under a sliding TTL and can be cleared only inside that namespace. This is
 exact prefix reuse, not semantic similarity.
 
+`--bulk-prefix-cache PATH` selects the block-backed alternative for generation.
+It stores only complete fixed-token blocks, restores the state at the end of the
+longest exact block, and evaluates the uncached suffix. The block size defaults to
+the checkpoint's `scan_chunk`; `--bulk-prefix-cache-namespace` is required, and
+the mapping and bulk prefix caches cannot be enabled together. RAM/SSD hit
+counters are logged as block probes, not as a claim about request-level speed.
+
 ## Architecture
 
 ```mermaid
 flowchart LR
     Input[UTF-8 bytes] --> Embedding
     Warm[RAM token cache] -.-> Embedding
-    Disk[Optional SSD prefix ledger] -. longest exact prefix .-> Recurrent
+    Mapping[Optional SSD mapping/prefix ledger] -. longest exact prefix .-> Recurrent
+    Bulk[Optional RAM/SSD BulkPrefixCache] -. longest complete block .-> Recurrent
     Embedding --> Recurrent[Bounded recurrent state]
     Recurrent --> Fast[Fast associative memory]
     Fast --> Residual[Reconstruction residual]
@@ -353,13 +361,14 @@ and 16 of 64. The mixing form reaches 4 of 4 and 63 of 64.
 The repository also contains ten opt-in optimization seams in
 [`docs/HERM_OPTIMIZATION_LAB.md`](docs/HERM_OPTIMIZATION_LAB.md). They remain
 outside the default `KoemiModel` and trainer until hardware and quality gates
-are measured:
+are measured. `BulkPrefixCache` is available only when generation explicitly
+selects it:
 
 | Front | Current contract | Boundary |
 | --- | --- | --- |
 | CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | PyTorch CUDA ops are implemented; no native `.cu` kernel or local CUDA timing |
 | Context | Multi-rate summary, exact prefix index, causal bounded admission | Summary is lossy; exact stores never perform semantic reuse |
-| Batching and bulk | Length-aware training plan, inference scheduler, exact RAM/SSD blocks, bounded async enqueue | Callers still execute the model and own integration; no end-to-end throughput claim |
+| Batching and bulk | Length-aware training plan, inference scheduler, exact RAM/SSD blocks, `BulkPrefixCache`, bounded async enqueue | `BulkPrefixCache` is opt-in at generation; schedulers and enqueue remain caller-owned; no end-to-end throughput claim |
 
 The local verification is CPU-only: the complete suite passes with conditional
 CUDA skips. This front records contracts and measurements to collect; it does
@@ -555,10 +564,11 @@ confidence gate or salient ring.
 - UTF-8 byte tokenization uses more positions than a learned tokenizer.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.
-- The optimization lab provides opt-in CUDA, context and batching seams, but
-  they are not wired into the default model or trainer. This CPU-only host has
-  not measured CUDA overlap, native kernel speed, end-to-end batching gain or
-  context quality; exact SSD block payloads are not encrypted.
+- The optimization lab provides opt-in CUDA, context and batching seams. The
+  exact `BulkPrefixCache` path is connected to generation, but it is not part of
+  the default model or trainer. This CPU-only host has not measured CUDA overlap,
+  native kernel speed, end-to-end batching gain or context quality; exact SSD
+  block payloads are not encrypted.
 
 ## Project layout
 
@@ -567,7 +577,7 @@ src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization and tokenizer
   model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
-  runtime/        parameter offload, inference batching, bulk blocks and async enqueue
+  runtime/        parameter offload, inference batching, bulk blocks, prefix cache and async enqueue
   training/       Causal chunks, objective, trainer, batching plan, checkpoint and generation
 benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines
 tests/            Data, model, cache, execution and training contracts

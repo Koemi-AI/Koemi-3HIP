@@ -45,6 +45,105 @@ class CachedPrefixState:
     state: KoemiState
 
 
+def build_prefix_state_payload(
+    prefix_length: int,
+    cached_prefix: CachedPrefixState,
+) -> dict[str, Any]:
+    if isinstance(prefix_length, bool) or not isinstance(prefix_length, int) or prefix_length < 1:
+        raise ValueError("prefix cache length must be a positive integer")
+    return {
+        "format_version": 1,
+        "entry_type": "prefix_state",
+        "prefix_length": prefix_length,
+        "last_logits": cached_prefix.last_logits.detach().cpu(),
+        "working_state": cached_prefix.state.working_state.detach().cpu(),
+        "memory_basis": cached_prefix.state.memory_basis.detach().cpu(),
+        "memory_normalizer": cached_prefix.state.memory_normalizer.detach().cpu(),
+        "refine_basis": cached_prefix.state.refine_basis.detach().cpu(),
+        "refine_normalizer": cached_prefix.state.refine_normalizer.detach().cpu(),
+        "local_keys": cached_prefix.state.local_keys.detach().cpu(),
+        "local_values": cached_prefix.state.local_values.detach().cpu(),
+        "local_valid": cached_prefix.state.local_valid.detach().cpu(),
+        "salient_keys": cached_prefix.state.salient_keys.detach().cpu(),
+        "salient_values": cached_prefix.state.salient_values.detach().cpu(),
+        "salient_valid": cached_prefix.state.salient_valid.detach().cpu(),
+        "last_token_ids": cached_prefix.state.last_token_ids.detach().cpu(),
+        "step_index": cached_prefix.state.step_index,
+    }
+
+
+def validate_prefix_state_payload(payload: Any, expected_prefix_length: int) -> CachedPrefixState:
+    format_version = payload.get("format_version") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or type(format_version) is not int or format_version != 1:
+        raise ValueError("prefix cache entry format is invalid")
+    prefix_length = payload.get("prefix_length")
+    if (
+        payload.get("entry_type") != "prefix_state"
+        or type(prefix_length) is not int
+        or prefix_length != expected_prefix_length
+    ):
+        raise ValueError("prefix cache entry identity is invalid")
+    tensor_names = (
+        "last_logits",
+        "working_state",
+        "memory_basis",
+        "memory_normalizer",
+        "refine_basis",
+        "refine_normalizer",
+        "local_keys",
+        "local_values",
+        "local_valid",
+        "salient_keys",
+        "salient_values",
+        "salient_valid",
+        "last_token_ids",
+    )
+    if not all(isinstance(payload.get(name), Tensor) for name in tensor_names):
+        raise ValueError("prefix cache entry tensors are invalid")
+    if payload["last_logits"].ndim != 2 or payload["last_logits"].shape[0] != 1:
+        raise ValueError("prefix cache logits are invalid")
+    step_index = payload.get("step_index")
+    if type(step_index) is not int or step_index != expected_prefix_length:
+        raise ValueError("prefix cache step index is invalid")
+    batch_size = payload["last_logits"].shape[0]
+    if payload["working_state"].ndim != 2 or payload["working_state"].shape[0] != batch_size:
+        raise ValueError("prefix cache working state is invalid")
+    if payload["memory_basis"].ndim != 3 or payload["memory_basis"].shape[0] != batch_size:
+        raise ValueError("prefix cache associative basis is invalid")
+    if payload["memory_normalizer"].shape != (batch_size, payload["memory_basis"].shape[2]):
+        raise ValueError("prefix cache associative normalizer is invalid")
+    if payload["refine_basis"].shape != payload["memory_basis"].shape:
+        raise ValueError("prefix cache refine basis is invalid")
+    if payload["refine_normalizer"].shape != payload["memory_normalizer"].shape:
+        raise ValueError("prefix cache refine normalizer is invalid")
+    for key_name, value_name, valid_name in (
+        ("local_keys", "local_values", "local_valid"),
+        ("salient_keys", "salient_values", "salient_valid"),
+    ):
+        if payload[key_name].ndim != 3 or payload[value_name].shape != payload[key_name].shape:
+            raise ValueError(f"prefix cache {key_name} are invalid")
+        if payload[valid_name].shape != payload[key_name].shape[:2]:
+            raise ValueError(f"prefix cache {valid_name} is invalid")
+    if payload["last_token_ids"].shape != (batch_size,):
+        raise ValueError("prefix cache context tokens are invalid")
+    state = KoemiState(
+        working_state=payload["working_state"],
+        memory_basis=payload["memory_basis"],
+        memory_normalizer=payload["memory_normalizer"],
+        refine_basis=payload["refine_basis"],
+        refine_normalizer=payload["refine_normalizer"],
+        local_keys=payload["local_keys"],
+        local_values=payload["local_values"],
+        local_valid=payload["local_valid"].to(dtype=torch.bool),
+        salient_keys=payload["salient_keys"],
+        salient_values=payload["salient_values"],
+        salient_valid=payload["salient_valid"].to(dtype=torch.bool),
+        last_token_ids=payload["last_token_ids"].to(dtype=torch.long),
+        step_index=payload["step_index"],
+    )
+    return CachedPrefixState(payload["last_logits"], state)
+
+
 class WarmTokenCache:
     def __init__(self, capacity: int) -> None:
         if capacity < 1:
@@ -282,25 +381,7 @@ class DiskMappingCache:
         if self.estimate_prefix_bytes(cached_prefix) > self.max_entry_bytes:
             return
         cache_path = self.prefix_path_for(input_ids)
-        payload = {
-            "format_version": 1,
-            "entry_type": "prefix_state",
-            "prefix_length": input_ids.shape[1],
-            "last_logits": cached_prefix.last_logits.detach().cpu(),
-            "working_state": cached_prefix.state.working_state.detach().cpu(),
-            "memory_basis": cached_prefix.state.memory_basis.detach().cpu(),
-            "memory_normalizer": cached_prefix.state.memory_normalizer.detach().cpu(),
-            "refine_basis": cached_prefix.state.refine_basis.detach().cpu(),
-            "refine_normalizer": cached_prefix.state.refine_normalizer.detach().cpu(),
-            "local_keys": cached_prefix.state.local_keys.detach().cpu(),
-            "local_values": cached_prefix.state.local_values.detach().cpu(),
-            "local_valid": cached_prefix.state.local_valid.detach().cpu(),
-            "salient_keys": cached_prefix.state.salient_keys.detach().cpu(),
-            "salient_values": cached_prefix.state.salient_values.detach().cpu(),
-            "salient_valid": cached_prefix.state.salient_valid.detach().cpu(),
-            "last_token_ids": cached_prefix.state.last_token_ids.detach().cpu(),
-            "step_index": cached_prefix.state.step_index,
-        }
+        payload = build_prefix_state_payload(input_ids.shape[1], cached_prefix)
         self.write_payload(cache_path, payload)
         self.purge_expired()
         self.evict_old_entries()
@@ -481,68 +562,7 @@ class DiskMappingCache:
         )
 
     def validate_prefix_payload(self, payload: Any, expected_prefix_length: int) -> CachedPrefixState:
-        if not isinstance(payload, dict) or payload.get("format_version") != 1:
-            raise ValueError("prefix cache entry format is invalid")
-        if payload.get("entry_type") != "prefix_state" or payload.get("prefix_length") != expected_prefix_length:
-            raise ValueError("prefix cache entry identity is invalid")
-        tensor_names = (
-            "last_logits",
-            "working_state",
-            "memory_basis",
-            "memory_normalizer",
-            "refine_basis",
-            "refine_normalizer",
-            "local_keys",
-            "local_values",
-            "local_valid",
-            "salient_keys",
-            "salient_values",
-            "salient_valid",
-            "last_token_ids",
-        )
-        if not all(isinstance(payload.get(name), Tensor) for name in tensor_names):
-            raise ValueError("prefix cache entry tensors are invalid")
-        if payload["last_logits"].ndim != 2 or payload["last_logits"].shape[0] != 1:
-            raise ValueError("prefix cache logits are invalid")
-        if not isinstance(payload.get("step_index"), int) or payload["step_index"] != expected_prefix_length:
-            raise ValueError("prefix cache step index is invalid")
-        batch_size = payload["last_logits"].shape[0]
-        if payload["working_state"].ndim != 2 or payload["working_state"].shape[0] != batch_size:
-            raise ValueError("prefix cache working state is invalid")
-        if payload["memory_basis"].ndim != 3 or payload["memory_basis"].shape[0] != batch_size:
-            raise ValueError("prefix cache associative basis is invalid")
-        if payload["memory_normalizer"].shape != (batch_size, payload["memory_basis"].shape[2]):
-            raise ValueError("prefix cache associative normalizer is invalid")
-        if payload["refine_basis"].shape != payload["memory_basis"].shape:
-            raise ValueError("prefix cache refine basis is invalid")
-        if payload["refine_normalizer"].shape != payload["memory_normalizer"].shape:
-            raise ValueError("prefix cache refine normalizer is invalid")
-        for key_name, value_name, valid_name in (
-            ("local_keys", "local_values", "local_valid"),
-            ("salient_keys", "salient_values", "salient_valid"),
-        ):
-            if payload[key_name].ndim != 3 or payload[value_name].shape != payload[key_name].shape:
-                raise ValueError(f"prefix cache {key_name} are invalid")
-            if payload[valid_name].shape != payload[key_name].shape[:2]:
-                raise ValueError(f"prefix cache {valid_name} is invalid")
-        if payload["last_token_ids"].shape != (batch_size,):
-            raise ValueError("prefix cache context tokens are invalid")
-        state = KoemiState(
-            working_state=payload["working_state"],
-            memory_basis=payload["memory_basis"],
-            memory_normalizer=payload["memory_normalizer"],
-            refine_basis=payload["refine_basis"],
-            refine_normalizer=payload["refine_normalizer"],
-            local_keys=payload["local_keys"],
-            local_values=payload["local_values"],
-            local_valid=payload["local_valid"].to(dtype=torch.bool),
-            salient_keys=payload["salient_keys"],
-            salient_values=payload["salient_values"],
-            salient_valid=payload["salient_valid"].to(dtype=torch.bool),
-            last_token_ids=payload["last_token_ids"].to(dtype=torch.long),
-            step_index=payload["step_index"],
-        )
-        return CachedPrefixState(payload["last_logits"], state)
+        return validate_prefix_state_payload(payload, expected_prefix_length)
 
     def write_payload(self, cache_path: Path, payload: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile(
