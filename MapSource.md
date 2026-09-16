@@ -628,6 +628,21 @@ ablate MIRAS-inspired retention, objective and update choices rather than
 replace it blindly. No superiority claim is valid until both models share
 parameters, tokens, data, seeds, hardware, training budget and recall tests.
 
+### D-032 - Colab is a worker, not an exposed kernel
+
+The 2026-09-16 integration check found no native Google Colab MCP endpoint or
+Colab runtime connector available in this session. A Google Drive connector
+can expose notebook files but cannot control a live GPU runtime. If agent
+control is needed, the supported design is a narrow authenticated MCP gateway
+with allowlisted operations, while Colab runs as a worker that reports status,
+metrics and artifacts. A persistent gateway is preferred over a direct tunnel
+to an ephemeral notebook runtime.
+
+Rejected alternative: exposing a public notebook endpoint that evaluates
+arbitrary Python or shell commands. It would turn a connector credential into
+remote code execution over the training filesystem and could spend Colab
+credits or leak model data.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -1074,6 +1089,25 @@ parameters, tokens, data, seeds, hardware, training budget and recall tests.
 - Proposed fix: enforce a padded-token budget, add length buckets and an
   integration harness for queue, cancellation, state ownership and shutdown;
   accept only measured p50/p95 and throughput improvement.
+
+### KOEMI-033 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `notebooks/Koemi-3HIP_A100.ipynb:1`
+- Condition: connecting a live Colab runtime through a tunnel or MCP server
+  would expose training data, checkpoints, filesystem access and compute
+  control unless the notebook side is constrained by an explicit tool
+  allowlist and authenticated job boundary.
+- Impact: unauthorized code execution, credential or model-data disclosure,
+  cross-session state access and uncontrolled consumption of Colab credits.
+- Evidence: the repository has no Colab MCP gateway contract; the current
+  integration search found only a file-oriented Google Drive connector, not a
+  live Colab runtime connector.
+- Proposed fix: expose only preflight, start-job, status, metrics, artifact and
+  stop-job operations; use short-lived authentication, request/job IDs,
+  quotas, audit logs and no arbitrary `eval`/shell tool. Prefer a persistent
+  gateway with an outbound Colab worker.
 
 ## Resolved suspicions
 
