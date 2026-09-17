@@ -79,6 +79,8 @@ class TrainingSettings:
     num_workers: int = 0
     pin_memory: bool = True
     prefetch_factor: int = 2
+    max_batch_tokens: int | None = None
+    length_bucket_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.execution_mode not in {"parallel", "sequential"}:
@@ -109,6 +111,20 @@ class TrainingSettings:
             raise ValueError("num_workers must be non-negative")
         if self.prefetch_factor < 1:
             raise ValueError("prefetch_factor must be at least 1")
+        if self.max_batch_tokens is not None:
+            if (
+                isinstance(self.max_batch_tokens, bool)
+                or not isinstance(self.max_batch_tokens, int)
+                or self.max_batch_tokens < 1
+            ):
+                raise ValueError("max_batch_tokens must be at least 1")
+        if self.length_bucket_size is not None:
+            if (
+                isinstance(self.length_bucket_size, bool)
+                or not isinstance(self.length_bucket_size, int)
+                or self.length_bucket_size < 1
+            ):
+                raise ValueError("length_bucket_size must be at least 1")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

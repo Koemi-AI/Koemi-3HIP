@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from koemi.configuration.settings import ModelSettings, TrainingSettings
+from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID, TrainingSettings
 from koemi.data.contracts import DatasetRecord
 from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.network import KoemiModel
@@ -80,6 +80,32 @@ class TrainingTests(unittest.TestCase):
     def test_training_settings_reject_negative_thinking_weight(self) -> None:
         with self.assertRaises(ValueError):
             TrainingSettings(thinking_loss_weight=-1.0)
+
+    def test_training_settings_reject_invalid_batching_limits(self) -> None:
+        with self.assertRaises(ValueError):
+            TrainingSettings(max_batch_tokens=0)
+        with self.assertRaises(ValueError):
+            TrainingSettings(max_batch_tokens=1.5)
+        with self.assertRaises(ValueError):
+            TrainingSettings(length_bucket_size=False)
+
+    def test_length_aware_loader_enforces_padded_budget_and_buckets(self) -> None:
+        dataset = CausalByteDataset(build_records(), sequence_length=8)
+        loader = create_training_loader(
+            dataset,
+            batch_size=3,
+            shuffle=False,
+            max_batch_tokens=16,
+            length_bucket_size=4,
+        )
+
+        for batch in loader:
+            lengths = [
+                int((row != PAD_TOKEN_ID).sum())
+                for row in batch["input_ids"]
+            ]
+            self.assertLessEqual(batch["input_ids"].numel(), 16)
+            self.assertLess(max(lengths) - min(lengths), 4)
 
     def test_accumulation_scheduler_validation_and_precision_metrics(self) -> None:
         torch.manual_seed(0)

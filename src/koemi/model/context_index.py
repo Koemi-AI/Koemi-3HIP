@@ -32,7 +32,11 @@ def _normalize_namespace(namespace: str) -> str:
 def _tensor_values(sequence: object) -> Iterable[Any] | None:
     if not hasattr(sequence, "detach") or not hasattr(sequence, "reshape"):
         return None
-    detached_sequence = sequence.detach().cpu()
+    detached_sequence = sequence.detach()
+    if detached_sequence.device.type != "cpu":
+        raise ValueError(
+            "context index tensor sequences must be materialized on CPU before indexing"
+        )
     dimensions = getattr(detached_sequence, "ndim", None)
     shape = getattr(detached_sequence, "shape", None)
     if dimensions == 2:
@@ -41,7 +45,7 @@ def _tensor_values(sequence: object) -> Iterable[Any] | None:
         detached_sequence = detached_sequence.reshape(-1)
     elif dimensions != 1:
         raise ValueError("context index tensor sequence must have one dimension")
-    return detached_sequence.tolist()
+    return detached_sequence.reshape(-1)
 
 
 def _normalize_sequence(sequence: object) -> tuple[int, ...]:

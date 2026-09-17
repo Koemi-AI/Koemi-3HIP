@@ -3,8 +3,9 @@
 Status: experimental and opt-in. The current machine has `torch 2.14.0+cpu`
 and no CUDA device. The modules below define bounded seams and executable
 contracts; `BulkPrefixCache` is connected to generation when explicitly
-selected, but the repository still has no measured GPU speedup, memory-quality
-improvement or end-to-end batching integration.
+selected. Length-aware training and prefill/decode batching are available at
+explicit opt-in boundaries, but the repository still has no measured GPU
+speedup, memory-quality improvement or end-to-end throughput result.
 
 ## Verdict
 
@@ -21,15 +22,17 @@ profile identifies as dominant.
 | CUDA scan | `koemi.model.cuda_scan` | CUDA-only affine scan with chunk carry, validation and synchronized diagnostics | PyTorch tensor-op backend; no native `.cu` kernel; not wired into `KoemiModel` |
 | State memory | `koemi.model.gpu_memory` | Reusable fixed-layout buffers with explicit reset/resize and optional stream scope | CPU-tested; CUDA path is conditional and unmeasured |
 | Precision | `koemi.model.gpu_precision` | Device-safe FP32/BF16/FP16 policy, scoped TF32 flags and FP32 comparison | CPU-tested; CUDA AMP and numerical tolerance are unmeasured |
-| Context summary | `koemi.model.context_summary` | Multi-rate bounded EMA slots, evidence and confidence-gated reads | Opt-in; validation and serialization cross to host memory |
+| Context summary | `koemi.model.context_summary` | Multi-rate bounded EMA slots, surprise-gated EMA/momentum memory, evidence and confidence-gated reads | Opt-in; `read_device` is the hot path, validation and serialization remain explicit host boundaries |
 | Context index | `koemi.model.context_index` | Exact namespace-aware longest-prefix index with TTL/LRU and explicit data serialization | CPU-side exact index; not semantic retrieval |
 | Context admission | `koemi.model.context_policy` | Causal bounded selection by surprise, recency and novelty | Opt-in; bounded but `O(batch × candidates × capacity)` |
-| Training batch | `koemi.training.batching_mode` | Length buckets, padded-token budget, stable permutation and accumulation boundaries | Plan-only; trainer and collation are unchanged |
-| Inference batch | `koemi.runtime.inference_batching` | Contract-compatible FIFO queues, padding, deadlines and request handles | Scheduler-only; caller executes and completes the model batch |
+| Training batch | `koemi.training.batching_mode` + `koemi.training.dataset` | Length buckets, padded-token budget, stable permutation and accumulation boundaries | Opt-in DataLoader sampler; default trainer loader path is unchanged |
+| Inference batch | `koemi.runtime.inference_batching` + `koemi.training.generation` | Contract-compatible FIFO queues, prefill/decode phases, padding, deadlines and request handles | Caller executes and completes the model batch; no scheduler-owned model call |
 | Exact blocks | `koemi.runtime.bulk_blocks` + `koemi.runtime.bulk_prefix_cache` | RAM/SSD fixed-token blocks with digest, TTL, capacity and validated prefix-state restore | `BulkPrefixCache` is connected to generation; SSD payloads are integrity-checked, not encrypted |
 | Async bulk | `koemi.runtime.bulk_executor` | Bounded CPU preparation plus optional CUDA stream/event enqueue | Pipeline seam; it does not execute a model or promise overlap |
+| Associative read | `koemi.model.memory` | Microblock-tiled causal read that bounds pairwise intermediate storage | Opt-in; compute remains quadratic and Python tile loops are unprofiled |
+| Expert dispatch | `koemi.model.experts` | Static tensor pair dispatch for inference without autograd/module hooks | Training and hooked/offloaded calls keep the reference module path for exactness |
 
-Nine seams remain separate from the default forward path. `BulkPrefixCache` is
+The seams remain separate from the default forward path. `BulkPrefixCache` is
 connected to generation only when explicitly selected. The exact context and
 bulk stores reject fuzzy reuse: a cache hit must identify the namespace and
 prove the complete token sequence before a bounded state is released.
@@ -39,18 +42,25 @@ prove the complete token sequence before a bounded state is released.
 Before these seams, the local baseline was Python 3.13.14 with PyTorch
 `2.14.0+cpu`: `compileall` passed and the existing suite ran 159 tests with one
 conditional CUDA skip. After the six model seams, the focused suite ran 63
-tests with 11 CUDA skips. After all ten seams, the complete suite ran 271 tests
-with 13 conditional CUDA skips, and `compileall` passed.
+tests with 11 CUDA skips. After the earlier ten seams, the complete suite ran
+271 tests with 13 conditional CUDA skips, and `compileall` passed.
 
 After connecting `BulkPrefixCache` to the opt-in generation path, the complete
 local suite ran 275 tests with 13 conditional CUDA skips, and `compileall`
 passed. This validates exact reuse and state restoration; it does not measure
 the cost of key hashing, SSD I/O or CUDA execution.
 
-The result is contract verification, not performance evidence. No A100/T4
-execution, CUDA kernel timing, GPU memory profile, end-to-end batch throughput,
-context recall ablation, cache hit-rate study, or quality comparison was run on
-this host. The default HERM model and trainer were intentionally not changed.
+The current prefill/decode, state-alignment and length-aware-loader regressions
+are covered by a focused 53-test command with one conditional CUDA skip. The
+complete final suite ran 300 tests with 13 conditional CUDA skips, and
+`compileall` passed. This section remains contract evidence, not performance
+evidence.
+
+No A100/T4 execution, CUDA kernel timing, GPU memory profile, end-to-end batch
+throughput, context recall ablation, cache hit-rate study, or quality comparison
+was run on this host. The default HERM model and loader path were intentionally
+not changed; the optional training sampler and generation APIs are explicit
+caller choices.
 
 ## GPU-first design
 
@@ -75,10 +85,10 @@ scalars because they are observability boundaries, not token-level kernels.
 ### Shape policy
 
 Length-aware training batches reduce padded work. Inference batches group only
-requests with the same model, device, dtype and namespace, then report real and
-padded tokens. Static length buckets are a prerequisite for reliable CUDA Graph
-experiments; dynamic shapes should be enabled only when the measured workload
-needs them and recompilation is controlled.
+requests with the same model, device, dtype, namespace and phase, then report
+real and padded tokens. Static length buckets are a prerequisite for reliable
+CUDA Graph experiments; dynamic shapes should be enabled only when the measured
+workload needs them and recompilation is controlled.
 
 ## Context and “Jenga” blocks
 
@@ -170,12 +180,13 @@ these measurements:
 1. Profile the unchanged HERM forward and backward on the target CUDA device.
 2. Integrate buffer reuse, pinned staging and explicit precision checks; measure
    memory and transfer overhead before changing the recurrence.
-3. Integrate length-aware training batches and continuous inference batching;
-   compare padding and queue metrics with the baseline.
+3. Measure the integrated length-aware training sampler and prefill/decode
+   inference batching; compare padding and queue metrics with the baseline.
 4. Evaluate exact prefix/block reuse and the EMA summary on quality tasks, with
    the default path still available as a control.
 5. Only then prototype a native fused scan or CUDA Graph capture for the exact
    static bucket that the profile selects.
 
 Until that gate is closed, “GPU-first”, `BulkPrefixCache` and “Jenga memory” are
-opt-in product paths or design directions, not measured performance capabilities.
+opt-in product paths or design directions, not measured performance capabilities;
+prefill/decode batching is also not a measured throughput result.

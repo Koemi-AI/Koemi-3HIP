@@ -54,7 +54,14 @@ com baselines ainda precisam ser fechados.
 - Frente de otimizacao experimental: seams opt-in para scan CUDA por operacoes
   PyTorch, buffers de estado, politica de precisao, resumo/indexacao de contexto,
   selecao causal, batching de treino/inferencia, blocos exatos RAM/SSD e enqueue
-  assincrono limitado; o caminho default permanece inalterado.
+  assincrono limitado; os caminhos de treino e generation so mudam quando o
+  sampler, as APIs de prefill/decode ou o cache sao selecionados explicitamente.
+- Batching experimental: buckets de comprimento, limite por tokens padded,
+  DataLoader length-aware, filas separadas por fase e staging pinned/non-blocking
+  quando CUDA esta disponivel.
+- Memoria experimental: `SurpriseMemory` causal com EMA/momentum bounded e
+  `scan_and_read_microblocks` para limitar intermediarios pairwise sem prometer
+  reducao da complexidade quadratica.
 
 ### Out of scope
 
@@ -108,6 +115,9 @@ com baselines ainda precisam ser fechados.
   testes locais; nenhum altera o forward default ou promete ganho de GPU.
 - [x] `BulkPrefixCache` integra blocos exatos RAM/SSD a generation de forma
   opt-in, restaura o maior prefixo completo e processa somente o sufixo.
+- [x] `prefill_batch`/`decode_batch` preservam ordem, isolamento de estado e
+  corrigem comprimentos reais depois de padding; o sampler de treino opcional
+  aplica buckets e budget de tokens padded.
 - [ ] Scan CUDA, AMP, streams, buffers, batching e overlap CPU/GPU passam a
   execucao real em GPU, com equivalencia de forward/backward e perfil
   end-to-end antes de qualquer integracao default.
@@ -173,7 +183,8 @@ flowchart LR
   admission policy.
 - `src/koemi/model/experts.py` - stacked expert bank, hash and learned dispatch.
 - `src/koemi/model/network.py` - Koemi-3HIP forward paths.
-- `src/koemi/training/dataset.py` - causal chunks and thinking masks.
+- `src/koemi/training/dataset.py` - causal chunks, thinking masks and optional
+  length-aware batch sampler.
 - `src/koemi/training/objective.py` - causal and thinking-weighted loss.
 - `src/koemi/training/trainer.py` - optimizer, metrics and logs.
 - `src/koemi/training/batching_mode.py` - length-aware microbatch plan and
@@ -181,9 +192,11 @@ flowchart LR
 - `src/koemi/training/a100_run.py` - pinned corpus, A100 preflight, calibration,
   BF16 loop, metrics and rotating Drive checkpoints.
 - `src/koemi/training/checkpoints.py` - weights-only checkpoint contract.
-- `src/koemi/training/generation.py` - longest-prefix resume and stateful generation.
-- `src/koemi/runtime/inference_batching.py` - compatible request queues, padded
-  batches, deadlines and result handles.
+- `src/koemi/training/generation.py` - longest-prefix resume, prefill batches,
+  recurrent decode batches and stateful generation.
+- `src/koemi/runtime/inference_batching.py` - compatible request queues, phase and
+  length-bucket separation, padded batches, pinned staging, deadlines and result
+  handles.
 - `src/koemi/runtime/bulk_blocks.py` - exact fixed-token RAM/SSD block store.
 - `src/koemi/runtime/bulk_prefix_cache.py` - exact block-backed prefix-state
   cache connected to generation.
@@ -373,12 +386,14 @@ parallel and sequential execution to disagree.
 
 ### D-013 - Use a static batched pair dispatch
 
-`ExpertMixture.combine` now sends every token-expert pair through batched `bmm`
-operations and masks invalid pairs after the expert computation. The static
-shape removes the dynamic occupancy conversion, host synchronization and
-per-expert Python loop from the hot path while keeping dispatch dropless. The
-trade-off is padded work and temporary gathered weights proportional to the
-number of token-expert pairs; CUDA memory and launch behavior remain unverified.
+`DeterministicExpertMixture` now sends every token-expert pair through a static
+tensor path during inference without autograd or module hooks. Invalid pairs are
+masked and duplicate top-k assignments are evaluated once while preserving
+dropless output. The path removes the per-expert Python loop from that inference
+case, but it still gathers parameter slices on every call. Autograd and hooked
+or offloaded calls keep the reference module path so existing bit-exact logits
+and gradient contracts remain intact; CUDA memory and launch behavior remain
+unverified.
 
 ### D-014 - Evaluate thinking through answer bytes
 
@@ -486,7 +501,9 @@ The parallel path no longer expands each write into `[B,L,d,m]` or asks the
 affine scan to retain one matrix per token. `MemoryWriteTerms` carries decay,
 value, feature and weight factors. `scan_and_read` forms the causal `[B,C,C]`
 write/query influence matrix and contracts it with values; it returns only the
-reads and the final `[B,d,m]` state. The sequential path remains the oracle.
+reads and the final `[B,d,m]` state. The opt-in `scan_and_read_microblocks`
+tiles the pairwise read so no single `[B,C,C]` intermediate is materialized,
+while retaining the same quadratic work. The sequential path remains the oracle.
 
 The startup gate is deliberately applied after the epsilon-regularized read:
 `confidence = den / (den + epsilon)`. This makes an inconsistent state with
@@ -570,12 +587,13 @@ weights.
 
 ### D-026 - Optimization seams remain opt-in until end-to-end proof
 
-The CUDA, buffer, precision, context and batching modules are separate contracts
-and do not alter `KoemiModel` or `Trainer` by import alone. A seam can enter the
-default path only after forward/backward equivalence, quality checks and a
-measured end-to-end win include its staging, padding, launch and synchronization
-costs. This keeps a plausible microbenchmark from becoming a regression in the
-real training loop.
+The CUDA, buffer, precision, context and batching modules are separate contracts.
+The length-aware sampler and prefill/decode APIs are available at explicit
+caller boundaries, while the default loader and model path remain unchanged.
+A seam can enter the default path only after forward/backward equivalence,
+quality checks and a measured end-to-end win include its staging, padding,
+launch and synchronization costs. This keeps a plausible microbenchmark from
+becoming a regression in the real training loop.
 
 ### D-027 - Bulk blocks are exact, bounded and namespace-scoped
 
@@ -656,6 +674,30 @@ integration boundary; a public tunnel would turn notebook control into remote
 code execution over the training filesystem and could spend Colab credits or
 leak model data.
 
+### D-033 - Keep surprise memory and microblocks opt-in
+
+`SurpriseMemory` is a small causal EMA plus momentum state keyed by the current
+surprise value. It is bounded, device-local and independently testable; it does
+not copy Titans' test-time optimizer or change the default HERM state. The
+microblock associative read similarly keeps the sequential path as the oracle
+and limits pairwise intermediate storage without claiming an asymptotic speedup.
+
+Rejected alternative: inserting either experiment into the default forward
+before a quality and profile gate. Both add state or tile launches, and neither
+has a measured CUDA or recall advantage on this CPU-only host.
+
+### D-034 - Use padded-token budgets at the loader boundary
+
+When `max_batch_tokens` or `length_bucket_size` is selected, the training
+DataLoader uses a deterministic length-aware sampler backed by `BatchingMode`.
+The budget is calculated from the longest sample in the planned batch, matching
+the actual padded tensor shape; the legacy DataLoader path remains unchanged
+when both options are absent. The CLI passes the same optional limits to the
+training and validation loaders.
+
+Rejected alternative: enforcing the limit only after collation, which would
+already have allocated an over-budget tensor.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -680,6 +722,10 @@ leak model data.
   de contexto e quatro seams Batching/Bulk implementados de forma opt-in, com
   contratos e testes locais; `BulkPrefixCache` foi integrado somente na
   fronteira opt-in de generation e o caminho default permanece inalterado.
+- [x] Frente D, 2026-09-16: prefill em lote e decode recorrente foram separados
+  por contrato e por API; filas agora isolam fase e bucket, limitam tokens
+  padded e fazem staging pinned/H2D non-blocking apenas quando CUDA suporta.
+  O scheduler e o `BulkExecutor` continuam sem executar o modelo.
 - [ ] Frente de otimizacao HERM: executar CUDA real, medir forward/backward,
   streams, VRAM, padding, fila, hit-rate e throughput end-to-end em hardware
   alvo antes de promover qualquer seam.
@@ -966,31 +1012,34 @@ leak model data.
 
 - Severity: medium
 - Status: open
-- Location: `src/koemi/model/context_summary.py:175-207`, `:297-334`
-- Condition: empty-read detection and state/value validation use
-  `.detach().cpu().item()` on the current implementation.
-- Impact: an opt-in GPU summary update or read can force host scalar
-  synchronization and erase the latency benefit of a short memory path.
-- Evidence: source audit on 2026-09-16; the default HERM path does not construct
+- Location: `src/koemi/model/context_summary.py:200-226`, `:350-388`
+- Condition: compatibility `read()` still uses `.detach().cpu().item()` to
+  preserve its nullable result, while validation uses private
+  `torch._assert_async` on non-CPU tensors.
+- Impact: callers that need nullable reads can force a host synchronization;
+  private validation APIs can change across PyTorch versions.
+- Evidence: `read_device()` and the update hot path pass a test that forbids
+  tensor `.item()` and `.cpu()` calls; the default HERM path does not construct
   `ContextSummary`.
-- Proposed fix: keep serialization and diagnostics at the host boundary, then
-  replace hot-path scalar checks with a supported asynchronous/device-side
-  validation strategy and measure the resulting error behavior on CUDA.
+- Proposed fix: keep nullable reads and serialization at explicit boundaries,
+  replace private device assertions with a supported API when available, and
+  measure CUDA behavior before making this memory default.
 
 ### KOEMI-025 #risk/medium
 
 - Severity: medium
 - Status: open
 - Location: `src/koemi/model/context_index.py:32-44`
-- Condition: tensor sequences passed to the CPU exact-prefix index are detached,
-  copied to CPU and converted to Python lists.
-- Impact: passing GPU token IDs to the index can introduce a device-to-host copy
-  and synchronization before a lookup, making a cache check more expensive than
-  the suffix it intends to skip.
-- Evidence: source audit on 2026-09-16; the index is intentionally CPU-side and
-  only CPU tensor execution was tested.
-- Proposed fix: require CPU sequences at this boundary or hash on the caller's
-  device and pass a validated digest, then compare end-to-end lookup cost.
+- Condition: tensor sequences passed to the CPU exact-prefix index are detached
+  but GPU tensors are rejected instead of being copied and converted implicitly.
+- Impact: callers that hold GPU token IDs must materialize CPU IDs or provide a
+  digest before lookup; refusing the input is visible, but it does not make a
+  GPU-side cache check cheap by itself.
+- Evidence: the CPU tensor path no longer calls `.cpu()` or `.tolist()`, and a
+  regression test detects an implicit CPU copy; only CPU tensor execution was
+  tested.
+- Proposed fix: keep this explicit CPU boundary or hash on the caller's device
+  and pass a validated digest, then compare end-to-end lookup cost.
 
 ### KOEMI-026 #risk/medium
 
@@ -1045,16 +1094,18 @@ leak model data.
 
 - Severity: high
 - Status: open
-- Location: `src/koemi/model/memory.py:97-144`
-- Condition: causal associative reads materialize pairwise influence with a
-  `[B,C,C]` structure inside each chunk.
-- Impact: work and temporary memory can grow approximately with
-  `B*C^2*(d+memory_features)`, limiting chunk size and dominating prefill.
-- Evidence: convergent read-only audit by three independent fronts on
-  2026-09-16; no CUDA profile has measured its share of end-to-end time.
-- Proposed fix: benchmark the current path against a tiled/microblock path
-  that carries only the state between blocks, then require causal and gradient
-  equivalence before replacing the implementation.
+- Location: `src/koemi/model/memory.py:97-250`
+- Condition: the default causal associative read still materializes pairwise
+  influence with a `[B,C,C]` structure; the opt-in microblock path only bounds
+  each intermediate tile.
+- Impact: work remains approximately quadratic and the default temporary memory
+  can grow with `B*C^2*(d+memory_features)`, limiting chunk size and dominating
+  prefill.
+- Evidence: `scan_and_read_microblocks` passed causal, state and gradient
+  equivalence tests locally, but no CUDA profile has measured its end-to-end
+  share or whether tile launches cost more than the memory saved.
+- Proposed fix: profile both paths on the target GPU and promote the tiled path
+  only if its full forward/backward latency and peak memory improve.
 
 ### KOEMI-030 #risk/high
 
@@ -1078,37 +1129,36 @@ leak model data.
 - Severity: medium
 - Status: open
 - Location: `src/koemi/model/experts.py:45-73`
-- Condition: expert dispatch still relies on Python iteration, `nonzero`,
-  indexed selection and accumulation, despite the static batched dispatch
-  intent recorded in `D-013`.
-- Impact: dynamic dispatch can cause graph breaks, irregular memory traffic and
-  poor GPU utilization; the decision and implementation may have drifted.
-- Evidence: source audit on 2026-09-16; no CUDA profiler or end-to-end dispatch
-  comparison was run in this audit.
-- Proposed fix: revalidate `D-013` against the current code, implement one
-  batched candidate only behind equivalence tests, and keep it opt-in until
-  forward-plus-backward timing proves a win.
+- Condition: inference without autograd or module hooks uses the static tensor
+  pair path, but training and hooked/offloaded calls still use Python iteration,
+  `nonzero`, indexed selection and accumulation for bit-exact compatibility;
+  the static path also gathers expert parameters on every call.
+- Impact: training can retain dynamic dispatch overhead, while inference can
+  retain allocation and launch overhead despite avoiding the per-expert loop.
+- Evidence: static forward and gradient-equivalence tests pass locally; the
+  full offload contract required the reference path for exact gradients. No
+  CUDA profiler or end-to-end dispatch comparison was run.
+- Proposed fix: profile inference and training separately, then introduce a
+  prepacked expert-bank representation only when it improves end-to-end time
+  without breaking offload or gradient contracts.
 
 ### KOEMI-032 #risk/medium
 
 - Severity: medium
 - Status: open
-- Location: `src/koemi/runtime/inference_batching.py:467-518`,
-  `src/koemi/runtime/batching_mode.py:123-139`
-- Condition: the scheduler limits raw token totals while emitted batches are
-  padded to the longest request, and the batching plan is not integrated into
-  the trainer or model execution path; `BulkExecutor` is still not connected
-  to model execution.
-- Impact: `max_batch_tokens` can understate actual work and memory, while the
-  exact prefix path does not provide multi-request batching or a measured
-  throughput/latency benefit by itself.
-- Evidence: source audit on 2026-09-16 found `BulkPrefixCache` calls from
-  `generation.py` into `BulkBlockStore`; no production references connect
-  `BulkExecutor` to `KoemiModel`, trainer or generation, and the executor does
-  not execute a model. No integrated CUDA execution was measured.
-- Proposed fix: enforce a padded-token budget, add length buckets and an
-  integration harness for queue, cancellation, state ownership and shutdown;
-  accept only measured p50/p95 and throughput improvement.
+- Location: `src/koemi/runtime/inference_batching.py:522-624`,
+  `src/koemi/training/generation.py:137-249`
+- Condition: the scheduler and generation APIs now separate prefill/decode,
+  length buckets and padded-token accounting, and the training loader can opt
+  into the same plan, but scheduler execution remains a caller-owned boundary;
+  pinned H2D and true overlap have no local CUDA proof.
+- Impact: the CPU contract prevents raw-token overfill and state mixing, but
+  it does not yet prove end-to-end multi-request throughput or GPU latency.
+- Evidence: focused runtime/training/prefix tests passed after covering padded
+  state alignment and the optional loader; `BulkExecutor` remains disconnected
+  and does not execute a model.
+- Proposed fix: run a CUDA integration harness with cancellation, state
+  ownership, pinned transfer and p50/p95 throughput before changing defaults.
 
 ### KOEMI-033 #risk/high
 
@@ -1146,6 +1196,21 @@ leak model data.
 - Proposed fix: benchmark the copy/hash cost against the skipped forward work,
   then retain host token IDs at the caller boundary or add a device-side key
   path only if the measured workload justifies its complexity.
+
+### KOEMI-035 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/context_summary.py:519-766`
+- Condition: `SurpriseMemory` is a new opt-in EMA/momentum memory with bounded
+  state, but it is not connected to `KoemiModel` and has no trained recall or
+  quality evaluation.
+- Impact: its extra state and update may add cost without improving long-context
+  retention; its behavior is not evidence that HERM should copy Titans.
+- Evidence: causal, finite, bounded and invalid-mask tests pass locally; no
+  multi-seed trained comparison or CUDA measurement exists.
+- Proposed fix: evaluate exact detail-recall and cost against unchanged HERM
+  before integrating the module or changing any default.
 
 ## Resolved suspicions
 
@@ -1757,3 +1822,30 @@ leak model data.
   history isolation, output/state equivalence and the real CLI path. The full
   suite passed 275 tests with 13 conditional CUDA skips, and `compileall`
   passed; CUDA performance remains unverified on this CPU-only host.
+
+### 2026-09-16 - Prefill/decode and padded inference batching
+
+- `src/koemi/training/generation.py` now exposes `PrefillRequest`/
+  `prefill_batch` and `DecodeRequest`/`decode_batch`; variable-length prompts
+  are right-aligned before the shared forward so local-memory tails retain the
+  valid suffix, and each returned state is sliced to one request with its step
+  index corrected for real, not padded, length. Prefix caches still use the
+  exact per-request path only.
+- `src/koemi/runtime/inference_batching.py` now separates `prefill` and
+  `decode` phases, groups optional length buckets, enforces the padded-token
+  budget, and stages CPU inputs through pinned memory with non-blocking H2D
+  only when CUDA is available. It never invokes a model.
+- `src/koemi/training/dataset.py` and `src/koemi/cli.py` now connect the
+  optional `BatchingMode` sampler to training and validation loaders through
+  `--max-batch-tokens` and `--length-bucket-size`; the default DataLoader path
+  remains unchanged.
+- Static expert pair dispatch is used for no-grad inference, while autograd and
+  hooked/offloaded execution retain the reference module path for bit-exact
+  contracts. `scan_and_read_microblocks` bounds pairwise intermediates, and
+  `SurpriseMemory` adds a separate causal EMA/momentum experiment without
+  changing HERM's default state.
+- Focused command:
+  `.koemi-venv\\Scripts\\python.exe -m unittest tests.runtime.test_inference_batching tests.training.test_batching_mode tests.model.test_prefix_ledger`
+  passed 53 tests with one conditional CUDA skip. The complete command passed
+  300 tests with 13 conditional CUDA skips, and `compileall` passed.
+  CUDA execution, overlap, performance and context quality remain unverified.

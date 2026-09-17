@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import copy
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from koemi.model.context_summary import ContextSummary, ContextSummaryState
+from koemi.model.context_summary import (
+    ContextSummary,
+    ContextSummaryState,
+    SurpriseMemory,
+)
 
 
 class ContextSummaryTests(unittest.TestCase):
@@ -116,6 +121,55 @@ class ContextSummaryTests(unittest.TestCase):
         self.assertEqual(1, summary.cost_statistics().active_slot_updates)
         self.assertEqual(8, summary.cost_statistics().estimated_element_updates)
 
+    def test_hot_update_and_device_read_do_not_extract_host_scalars(self) -> None:
+        summary = ContextSummary(2, 2, measure_cost=True)
+        state = summary.create_state(1)
+
+        with patch.object(torch.Tensor, "item", side_effect=AssertionError("host scalar read")), patch.object(
+            torch.Tensor, "cpu", side_effect=AssertionError("host tensor copy")
+        ):
+            updated = summary.update(state, torch.ones(1, 2))
+            result = summary.read_device(updated)
+
+        self.assertTrue(torch.isfinite(result.value).all())
+        self.assertEqual(2, summary.cost_statistics().active_slot_updates)
+
+    def test_surprise_memory_is_causal_bounded_and_opt_in(self) -> None:
+        memory = SurpriseMemory(3, max_evidence=2)
+        empty = memory.create_state(1)
+        values = torch.tensor([[0.2, -0.4, 0.6]])
+        first = memory.update(empty, values, torch.tensor([1.0]))
+        first_value = first.value.clone()
+        future_a = memory.update(first, torch.full_like(values, 1.0e20), torch.tensor([2.0]))
+        future_b = memory.update(first, torch.full_like(values, -1.0e20), torch.tensor([-2.0]))
+        limited = memory.update(future_a, values, torch.tensor([1.0]))
+        result = memory.read(limited)
+
+        self.assertTrue(torch.equal(first.value, first_value))
+        self.assertFalse(torch.equal(future_a.value, future_b.value))
+        self.assertTrue(torch.isfinite(result.value).all())
+        self.assertTrue(torch.isfinite(result.confidence).all())
+        self.assertLessEqual(float(limited.value.abs().max()), 1.0)
+        self.assertLessEqual(float(limited.momentum.abs().max()), 1.0)
+        self.assertTrue(torch.all(limited.evidence == 2))
+
+    def test_surprise_memory_masks_invalid_steps_and_rejects_non_finite_input(self) -> None:
+        memory = SurpriseMemory(2)
+        state = memory.create_state(1)
+        masked = memory.update(
+            state,
+            torch.ones(1, 2),
+            torch.ones(1),
+            valid_mask=torch.tensor([False]),
+        )
+
+        self.assertTrue(torch.equal(masked.value, state.value))
+        self.assertTrue(torch.equal(masked.momentum, state.momentum))
+        self.assertTrue(torch.equal(masked.evidence, state.evidence))
+        self.assertEqual(1, masked.step_index)
+        with self.assertRaises(ValueError):
+            memory.update(state, torch.tensor([[float("nan"), 0.0]]), torch.ones(1))
+
     def test_shape_dtype_device_and_limit_validation(self) -> None:
         summary = ContextSummary(2, 3, max_batch_size=1)
         state = summary.create_state(1)
@@ -173,7 +227,9 @@ class ContextSummaryTests(unittest.TestCase):
 
         model = KoemiModel(ModelSettings(embedding_size=8, memory_features=2))
 
-        self.assertFalse(any(isinstance(module, ContextSummary) for module in model.modules()))
+        self.assertFalse(
+            any(isinstance(module, (ContextSummary, SurpriseMemory)) for module in model.modules())
+        )
 
 
 if __name__ == "__main__":

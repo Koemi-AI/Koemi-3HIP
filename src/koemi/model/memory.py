@@ -143,6 +143,104 @@ class HierarchicalAssociativeMemory(nn.Module):
         )
         return read, final_basis, final_normalizer
 
+    def scan_and_read_microblocks(
+        self,
+        initial_basis: Tensor,
+        initial_normalizer: Tensor,
+        terms: MemoryWriteTerms,
+        query_source: Tensor,
+        microblock_size: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute causal reads with bounded query/write tiles.
+
+        ``microblock_size`` must be positive. Returns reads, final basis, and
+        final normalizer without changing module state.
+        """
+        if isinstance(microblock_size, bool) or not isinstance(microblock_size, int) or microblock_size <= 0:
+            raise ValueError("microblock_size must be a positive integer")
+
+        length = terms.value.shape[1]
+        if length == 0:
+            empty_read = terms.value.new_empty(terms.value.shape[0], 0, terms.value.shape[-1])
+            return empty_read, initial_basis, initial_normalizer
+
+        query_features = self.query_features(query_source)
+        decay = terms.decay.squeeze(-1)
+        cumulative_log_decay = torch.cumsum(torch.log(decay.float()), dim=1)
+        prior_log_decay = cumulative_log_decay - torch.log(decay.float())
+        initial_factors = torch.exp(prior_log_decay).to(dtype=terms.value.dtype)
+        initial_numerator = torch.einsum("bdm,btm->btd", initial_basis, query_features)
+        initial_denominator = torch.einsum("bm,btm->bt", initial_normalizer, query_features)
+        positions = torch.arange(length, device=terms.value.device)
+        numerator_blocks = []
+        denominator_blocks = []
+
+        for target_start in range(0, length, microblock_size):
+            target_end = min(target_start + microblock_size, length)
+            target_positions = positions[target_start:target_end]
+            target_numerator = (
+                initial_factors[:, target_start:target_end].unsqueeze(-1)
+                * initial_numerator[:, target_start:target_end]
+            )
+            target_denominator = (
+                initial_factors[:, target_start:target_end]
+                * initial_denominator[:, target_start:target_end]
+            )
+
+            for source_start in range(0, target_end, microblock_size):
+                source_end = min(source_start + microblock_size, target_end)
+                source_positions = positions[source_start:source_end]
+                causal_mask = source_positions.unsqueeze(0) < target_positions.unsqueeze(1)
+                pair_log_decay = (
+                    prior_log_decay[:, target_start:target_end].unsqueeze(-1)
+                    - cumulative_log_decay[:, source_start:source_end].unsqueeze(1)
+                ).masked_fill(~causal_mask, float("-inf"))
+                pair_decay = torch.exp(pair_log_decay).to(dtype=terms.value.dtype)
+                feature_similarity = torch.einsum(
+                    "bsm,btm->bts",
+                    terms.features[:, source_start:source_end],
+                    query_features[:, target_start:target_end],
+                )
+                write_influence = (
+                    pair_decay
+                    * feature_similarity
+                    * terms.write_weight[:, source_start:source_end].unsqueeze(1)
+                )
+                target_numerator = target_numerator + torch.einsum(
+                    "bts,bsd->btd",
+                    write_influence,
+                    terms.value[:, source_start:source_end],
+                )
+                target_denominator = target_denominator + write_influence.sum(dim=-1)
+
+            numerator_blocks.append(target_numerator)
+            denominator_blocks.append(target_denominator)
+
+        numerator = torch.cat(numerator_blocks, dim=1)
+        denominator = torch.cat(denominator_blocks, dim=1)
+        read = self.confidence_weighted_read(numerator, denominator.unsqueeze(-1))
+
+        total_log_decay = cumulative_log_decay[:, -1]
+        initial_final_factor = torch.exp(total_log_decay).to(dtype=terms.value.dtype)
+        final_write_decay = torch.exp(total_log_decay.unsqueeze(1) - cumulative_log_decay).to(
+            dtype=terms.value.dtype
+        )
+        final_write_weight = final_write_decay * terms.write_weight
+        final_basis = initial_final_factor.unsqueeze(-1).unsqueeze(-1) * initial_basis
+        final_basis = final_basis + torch.einsum(
+            "bs,bsd,bsm->bdm",
+            final_write_weight,
+            terms.value,
+            terms.features,
+        )
+        final_normalizer = initial_final_factor.unsqueeze(-1) * initial_normalizer
+        final_normalizer = final_normalizer + torch.einsum(
+            "bs,bsm->bm",
+            final_write_weight,
+            terms.features,
+        )
+        return read, final_basis, final_normalizer
+
     def query_features(self, query_source: Tensor) -> Tensor:
         query = self.query_projection(query_source)
         return torch.softmax(self.feature_projection(query), dim=-1)

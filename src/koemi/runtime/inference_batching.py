@@ -19,6 +19,9 @@ from koemi.model.state import KoemiState
 DEFAULT_MAX_WAIT_SECONDS = 0.005
 DEFAULT_MAX_BATCH_ITEMS = 8
 DEFAULT_MAX_BATCH_TOKENS = 2048
+PREFILL_PHASE = "prefill"
+DECODE_PHASE = "decode"
+_VALID_PHASES = frozenset((PREFILL_PHASE, DECODE_PHASE))
 
 _STATE_TENSOR_FIELDS = (
     "working_state",
@@ -49,18 +52,21 @@ _STATE_FLOAT_FIELDS = (
 
 @dataclass(frozen=True)
 class BatchContract:
-    """Identifies requests that can share one inference batch."""
+    """Identifies requests that can share one inference phase and batch."""
 
     model_id: str
     device: torch.device | str
     dtype: torch.dtype
     namespace: str
+    phase: str = PREFILL_PHASE
 
     def __post_init__(self) -> None:
         if not isinstance(self.model_id, str) or not self.model_id.strip():
             raise ValueError("model_id must be a non-empty string")
         if not isinstance(self.namespace, str) or not self.namespace.strip():
             raise ValueError("namespace must be a non-empty string")
+        if not isinstance(self.phase, str) or self.phase not in _VALID_PHASES:
+            raise ValueError(f"phase must be one of {sorted(_VALID_PHASES)}")
         normalized_device = _normalize_device(self.device)
         if not isinstance(self.dtype, torch.dtype):
             raise TypeError("dtype must be a torch.dtype")
@@ -69,6 +75,10 @@ class BatchContract:
     @property
     def key(self) -> tuple[str, str, str, str]:
         return self.model_id, str(self.device), str(self.dtype), self.namespace
+
+    @property
+    def scheduling_key(self) -> tuple[str, str, str, str, str]:
+        return (*self.key, self.phase)
 
 
 @dataclass(frozen=True)
@@ -117,7 +127,12 @@ class InferenceResult:
 
 @dataclass(frozen=True)
 class InferenceBatch:
-    """Padded request batch and the per-request state handles it represents."""
+    """Padded request batch and the per-request state handles it represents.
+
+    `padded_token_count` is the scheduler budget unit. `pinned_host_memory` and
+    `non_blocking_transfer` describe the optional CPU-to-CUDA staging that
+    produced the tensors; they are false for the CPU path.
+    """
 
     batch_id: int
     contract: BatchContract
@@ -128,6 +143,8 @@ class InferenceBatch:
     sequence_lengths: tuple[int, ...]
     handles: tuple[InferenceRequestHandle, ...]
     dispatched_at: float
+    pinned_host_memory: bool = False
+    non_blocking_transfer: bool = False
 
     @property
     def token_count(self) -> int:
@@ -196,16 +213,31 @@ class InferenceBatchScheduler:
         max_batch_items: int = DEFAULT_MAX_BATCH_ITEMS,
         max_batch_tokens: int = DEFAULT_MAX_BATCH_TOKENS,
         clock: Callable[[], float] | None = None,
+        length_bucket_size: int | None = None,
+        pin_memory: bool = True,
     ) -> None:
+        """Create an opt-in queue with a padded-token budget.
+
+        Requests are partitioned by contract phase and, when configured, by
+        length bucket. The scheduler does not invoke a model or own execution.
+        """
         self._max_wait_seconds = _validate_non_negative_float(max_wait_seconds, "max_wait_seconds")
         self._max_batch_items = _validate_positive_int(max_batch_items, "max_batch_items")
         self._max_batch_tokens = _validate_positive_int(max_batch_tokens, "max_batch_tokens")
+        self._length_bucket_size = (
+            None
+            if length_bucket_size is None
+            else _validate_positive_int(length_bucket_size, "length_bucket_size")
+        )
+        if not isinstance(pin_memory, bool):
+            raise TypeError("pin_memory must be a boolean")
+        self._pin_memory = pin_memory
         if clock is not None and not callable(clock):
             raise TypeError("clock must be callable")
         self._clock = clock or time.monotonic
         self._lock = threading.Lock()
-        self._pending_by_key: dict[tuple[str, str, str, str], deque[_QueuedRequest]] = {}
-        self._group_order: deque[tuple[str, str, str, str]] = deque()
+        self._pending_by_key: dict[tuple[str, str, str, str, str, int | None], deque[_QueuedRequest]] = {}
+        self._group_order: deque[tuple[str, str, str, str, str, int | None]] = deque()
         self._requests: dict[str, _QueuedRequest] = {}
         self._active_batches: dict[int, _ActiveBatch] = {}
         self._next_batch_id = 1
@@ -238,8 +270,12 @@ class InferenceBatchScheduler:
             raise TypeError("contract must be a BatchContract")
         normalized_input_ids = _normalize_input_ids(input_ids, contract)
         token_count = int(normalized_input_ids.numel())
+        if contract.phase == DECODE_PHASE and token_count != 1:
+            raise ValueError("decode requests must contain exactly one token")
         if token_count > self._max_batch_tokens:
-            raise ValueError("request token count exceeds max_batch_tokens")
+            raise ValueError("request padded token count exceeds max_batch_tokens")
+        if contract.phase == DECODE_PHASE and initial_state is None:
+            raise ValueError("decode requests require an initial recurrent state")
         _validate_state(initial_state, contract, "initial_state")
         timeout = _validate_timeout(timeout_seconds)
         enqueued_at = _validate_time(self._clock(), "clock")
@@ -256,7 +292,7 @@ class InferenceBatchScheduler:
             handle=handle,
             future=future,
         )
-        group_key = contract.key
+        group_key = self._group_key(contract, token_count)
         with self._lock:
             if request_id in self._requests:
                 raise ValueError(f"request_id is already active: {request_id}")
@@ -357,8 +393,11 @@ class InferenceBatchScheduler:
             if missing_states:
                 raise ValueError(f"final_states missing request IDs: {missing_states}")
             for request in active_requests:
+                final_state = state_by_id[request.request_id]
+                if request.contract.phase == DECODE_PHASE and final_state is None:
+                    raise ValueError("decode requests require a recurrent final state")
                 _validate_state(
-                    state_by_id[request.request_id],
+                    final_state,
                     request.contract,
                     "final_state",
                 )
@@ -432,6 +471,18 @@ class InferenceBatchScheduler:
     def _resolve_time(self, value: float | None) -> float:
         return _validate_time(self._clock() if value is None else value, "time")
 
+    def _group_key(
+        self,
+        contract: BatchContract,
+        sequence_length: int,
+    ) -> tuple[str, str, str, str, str, int | None]:
+        bucket_key = (
+            None
+            if self._length_bucket_size is None
+            else (sequence_length - 1) // self._length_bucket_size
+        )
+        return (*contract.scheduling_key, bucket_key)
+
     def _dispatch_ready(self, current_time: float, force: bool) -> tuple[InferenceBatch, ...]:
         with self._lock:
             timed_out_futures = self._expire_locked(current_time)
@@ -474,25 +525,33 @@ class InferenceBatchScheduler:
             return True
         if len(queue) >= self._max_batch_items:
             return True
-        queued_tokens = sum(request.input_ids.numel() for request in queue)
-        if queued_tokens >= self._max_batch_tokens:
+        selected = self._select_requests(queue)
+        if self._padded_token_count(selected) >= self._max_batch_tokens:
             return True
         return current_time - queue[0].enqueued_at >= self._max_wait_seconds
 
     def _select_requests(self, queue: deque[_QueuedRequest]) -> tuple[_QueuedRequest, ...]:
         selected: list[_QueuedRequest] = []
-        selected_tokens = 0
+        selected_max_length = 0
         for request in queue:
             if len(selected) >= self._max_batch_items:
                 break
             request_tokens = int(request.input_ids.numel())
-            if selected and selected_tokens + request_tokens > self._max_batch_tokens:
+            proposed_max_length = max(selected_max_length, request_tokens)
+            proposed_padded_tokens = (len(selected) + 1) * proposed_max_length
+            if selected and proposed_padded_tokens > self._max_batch_tokens:
                 break
             selected.append(request)
-            selected_tokens += request_tokens
+            selected_max_length = proposed_max_length
         if not selected:
             raise RuntimeError("ready queue did not yield a batch")
         return tuple(selected)
+
+    @staticmethod
+    def _padded_token_count(requests: Sequence[_QueuedRequest]) -> int:
+        if not requests:
+            return 0
+        return len(requests) * max(int(request.input_ids.numel()) for request in requests)
 
     def _create_batch_locked(
         self,
@@ -501,21 +560,11 @@ class InferenceBatchScheduler:
     ) -> InferenceBatch:
         contract = requests[0].contract
         maximum_length = max(request.input_ids.numel() for request in requests)
-        input_ids = torch.full(
-            (len(requests), maximum_length),
-            PAD_TOKEN_ID,
-            dtype=torch.long,
-            device=contract.device,
+        input_ids, attention_mask, pinned_host_memory, non_blocking_transfer = self._prepare_batch_tensors(
+            requests,
+            maximum_length,
+            contract,
         )
-        attention_mask = torch.zeros(
-            (len(requests), maximum_length),
-            dtype=torch.bool,
-            device=contract.device,
-        )
-        for row_index, request in enumerate(requests):
-            length = request.input_ids.numel()
-            input_ids[row_index, :length].copy_(request.input_ids)
-            attention_mask[row_index, :length] = True
         batch_id = self._next_batch_id
         self._next_batch_id += 1
         return InferenceBatch(
@@ -528,7 +577,64 @@ class InferenceBatchScheduler:
             sequence_lengths=tuple(int(request.input_ids.numel()) for request in requests),
             handles=tuple(request.handle for request in requests),
             dispatched_at=dispatched_at,
+            pinned_host_memory=pinned_host_memory,
+            non_blocking_transfer=non_blocking_transfer,
         )
+
+    def _prepare_batch_tensors(
+        self,
+        requests: tuple[_QueuedRequest, ...],
+        maximum_length: int,
+        contract: BatchContract,
+    ) -> tuple[Tensor, Tensor, bool, bool]:
+        shape = (len(requests), maximum_length)
+        destination_device = contract.device
+        if destination_device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA batch contract cannot be dispatched without CUDA")
+        can_stage_cpu_inputs = (
+            destination_device.type == "cuda"
+            and all(request.input_ids.device.type == "cpu" for request in requests)
+        )
+        if can_stage_cpu_inputs:
+            pinned_host_memory = self._pin_memory
+            host_input_ids = torch.full(
+                shape,
+                PAD_TOKEN_ID,
+                dtype=torch.long,
+                device="cpu",
+                pin_memory=pinned_host_memory,
+            )
+            host_attention_mask = torch.zeros(
+                shape,
+                dtype=torch.bool,
+                device="cpu",
+                pin_memory=pinned_host_memory,
+            )
+            for row_index, request in enumerate(requests):
+                length = request.input_ids.numel()
+                host_input_ids[row_index, :length].copy_(request.input_ids)
+                host_attention_mask[row_index, :length] = True
+            return (
+                host_input_ids.to(destination_device, non_blocking=pinned_host_memory),
+                host_attention_mask.to(destination_device, non_blocking=pinned_host_memory),
+                pinned_host_memory,
+                pinned_host_memory,
+            )
+        input_ids = torch.full(
+            shape,
+            PAD_TOKEN_ID,
+            dtype=torch.long,
+            device=destination_device,
+        )
+        attention_mask = torch.zeros(shape, dtype=torch.bool, device=destination_device)
+        for row_index, request in enumerate(requests):
+            length = request.input_ids.numel()
+            source = request.input_ids
+            if source.device != destination_device:
+                source = source.to(destination_device, non_blocking=False)
+            input_ids[row_index, :length].copy_(source)
+            attention_mask[row_index, :length] = True
+        return input_ids, attention_mask, False, False
 
     def _expire_locked(self, current_time: float) -> list[Future[InferenceResult]]:
         timed_out_futures: list[Future[InferenceResult]] = []
@@ -564,7 +670,7 @@ class InferenceBatchScheduler:
         return timed_out_futures
 
     def _remove_queued_request_locked(self, request: _QueuedRequest) -> None:
-        group_key = request.contract.key
+        group_key = self._group_key(request.contract, int(request.input_ids.numel()))
         queue = self._pending_by_key[group_key]
         queue.remove(request)
         self._pending_requests -= 1
@@ -572,7 +678,10 @@ class InferenceBatchScheduler:
         if not queue:
             self._remove_empty_group_locked(group_key)
 
-    def _remove_empty_group_locked(self, group_key: tuple[str, str, str, str]) -> None:
+    def _remove_empty_group_locked(
+        self,
+        group_key: tuple[str, str, str, str, str, int | None],
+    ) -> None:
         queue = self._pending_by_key.get(group_key)
         if queue:
             return
@@ -689,8 +798,10 @@ def _values_by_request_id(
 __all__ = [
     "BatchContract",
     "BatchingMetrics",
+    "DECODE_PHASE",
     "InferenceBatch",
     "InferenceBatchScheduler",
     "InferenceRequestHandle",
     "InferenceResult",
+    "PREFILL_PHASE",
 ]

@@ -57,12 +57,30 @@ class ContextIndexTests(unittest.TestCase):
     def test_cpu_tensor_sequences_are_normalized_to_exact_token_ids(self) -> None:
         index = ContextIndex(capacity=2, ttl_seconds=60.0)
         input_ids = torch.tensor([[17, 18, 19]], dtype=torch.long)
-        index.put("model", input_ids[:, :2], {"state": [1]})
+        with patch.object(torch.Tensor, "cpu", side_effect=AssertionError("implicit host copy")):
+            index.put("model", input_ids[:, :2], {"state": [1]})
 
-        candidate = index.get_longest_prefix("model", torch.tensor([[17, 18, 20]], dtype=torch.long))
+            candidate = index.get_longest_prefix(
+                "model", torch.tensor([[17, 18, 20]], dtype=torch.long)
+            )
 
         self.assertIsNotNone(candidate)
         self.assertEqual((17, 18), candidate.sequence)
+
+    def test_gpu_tensor_sequences_are_rejected_before_implicit_host_copy(self) -> None:
+        class DeviceSequence:
+            device = torch.device("cuda")
+            ndim = 1
+            shape = (1,)
+
+            def detach(self):
+                return self
+
+            def reshape(self, *shape):
+                return self
+
+        with self.assertRaisesRegex(ValueError, "materialized on CPU"):
+            ContextIndex(capacity=2, ttl_seconds=60.0).put("model", DeviceSequence(), {"state": [1]})
 
     def test_hash_collision_still_requires_exact_sequence_equality(self) -> None:
         constant_digest = "a" * 64

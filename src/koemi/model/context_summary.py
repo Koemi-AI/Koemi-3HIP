@@ -48,6 +48,30 @@ class ContextSummaryCost:
     estimated_element_updates: int
 
 
+@dataclass(frozen=True)
+class SurpriseMemoryState:
+    value: Tensor
+    momentum: Tensor
+    evidence: Tensor
+    step_index: int
+
+
+@dataclass(frozen=True)
+class SurpriseMemoryRead:
+    value: Tensor
+    confidence: Tensor
+    evidence: Tensor
+    mask: Tensor
+
+
+def _assert_tensor_condition(condition: Tensor, message: str) -> None:
+    if condition.device.type == "cpu":
+        if not bool(condition):
+            raise ValueError(message)
+        return
+    torch._assert_async(condition, message)
+
+
 class ContextSummary(nn.Module):
     """Finite, opt-in hierarchical EMA summaries for one isolated batch state."""
 
@@ -86,6 +110,11 @@ class ContextSummary(nn.Module):
             self.decay_logits = nn.Parameter(decay_logits)
         else:
             self.register_buffer("decay_values", torch.tensor(decay_values, dtype=torch.get_default_dtype()))
+        self.register_buffer(
+            "_cost_active_slot_updates",
+            torch.zeros((), dtype=torch.int64),
+            persistent=False,
+        )
         self._cost = ContextSummaryCost(0, 0, 0)
 
     def create_state(
@@ -148,8 +177,8 @@ class ContextSummary(nn.Module):
             "slot_mask",
         )
         if valid_mask is None:
-            valid_mask = torch.ones(values.shape[0], device=state.slots.device, dtype=torch.bool)
-        if slot_mask is None:
+            active_slots = slot_mask
+        elif slot_mask is None:
             active_slots = valid_mask.unsqueeze(1).expand(-1, self.slot_count)
         else:
             active_slots = valid_mask.unsqueeze(1) & slot_mask
@@ -159,11 +188,16 @@ class ContextSummary(nn.Module):
         update_rate = (1.0 - self._decays()).to(dtype=state.slots.dtype).view(1, self.slot_count, 1)
         bounded_values = torch.tanh(values).unsqueeze(1)
         candidate_slots = state.slots + update_rate * (bounded_values - state.slots)
-        next_slots = torch.where(active_slots.unsqueeze(-1), candidate_slots, state.slots).clamp(-1.0, 1.0)
-        next_evidence = torch.minimum(
-            state.evidence + active_slots.to(dtype=torch.int64),
-            torch.full_like(state.evidence, self.max_evidence),
-        )
+        if active_slots is None:
+            next_slots = candidate_slots.clamp(-1.0, 1.0)
+            next_evidence = (state.evidence + 1).clamp_max(self.max_evidence)
+        else:
+            next_slots = torch.where(
+                active_slots.unsqueeze(-1), candidate_slots, state.slots
+            ).clamp(-1.0, 1.0)
+            next_evidence = (
+                state.evidence + active_slots.to(dtype=torch.int64)
+            ).clamp_max(self.max_evidence)
         if detach:
             next_slots = next_slots.detach()
             next_evidence = next_evidence.detach()
@@ -173,21 +207,30 @@ class ContextSummary(nn.Module):
         return next_state
 
     def read(self, state: ContextSummaryState, *, detach: bool = False) -> ContextSummaryRead | None:
-        """Read evidence-weighted slots; return None when the entire batch is empty."""
+        """Read evidence-weighted slots; return None when the batch is empty.
+
+        This compatibility method preserves the nullable result contract and may
+        synchronize when the evidence lives on CUDA. Use :meth:`read_device` in
+        a device-hot path when an empty read can be represented by zero confidence.
+        """
         self._validate_state(state)
         self._validate_detach(detach)
         has_evidence = bool(torch.any(state.evidence > 0).detach().cpu().item())
         if not has_evidence:
             return None
+        return self._read_validated(state, detach)
+
+    def read_device(self, state: ContextSummaryState, *, detach: bool = False) -> ContextSummaryRead:
+        """Read without a host scalar check; an empty state returns zero confidence."""
+        self._validate_state(state)
+        self._validate_detach(detach)
+        return self._read_validated(state, detach)
+
+    def _read_validated(self, state: ContextSummaryState, detach: bool) -> ContextSummaryRead:
         evidence_dtype = torch.float64 if state.slots.dtype == torch.float64 else torch.float32
         evidence = state.evidence.to(dtype=evidence_dtype)
         total_evidence = evidence.sum(dim=1)
         normalized_evidence = evidence / total_evidence.clamp_min(1.0).unsqueeze(1)
-        normalized_evidence = torch.where(
-            total_evidence.unsqueeze(1) > 0.0,
-            normalized_evidence,
-            torch.zeros_like(normalized_evidence),
-        )
         slot_weights = normalized_evidence.to(dtype=state.slots.dtype)
         aggregated_value = torch.sum(slot_weights.unsqueeze(-1) * state.slots, dim=1)
         confidence = (1.0 - torch.exp(-total_evidence / self.confidence_scale)).clamp(0.0, 1.0)
@@ -270,10 +313,15 @@ class ContextSummary(nn.Module):
 
     def cost_statistics(self) -> ContextSummaryCost:
         """Return aggregate update instrumentation without exposing tensors or session data."""
-        return self._cost
+        return ContextSummaryCost(
+            update_calls=self._cost.update_calls,
+            active_slot_updates=int(self._cost_active_slot_updates.detach().item()),
+            estimated_element_updates=self._cost.estimated_element_updates,
+        )
 
     def reset_cost_statistics(self) -> None:
         """Reset aggregate update instrumentation."""
+        self._cost_active_slot_updates.zero_()
         self._cost = ContextSummaryCost(0, 0, 0)
 
     def _decays(self) -> Tensor:
@@ -281,11 +329,14 @@ class ContextSummary(nn.Module):
             return torch.sigmoid(self.decay_logits)
         return self.decay_values
 
-    def _record_cost(self, active_slots: Tensor, batch_size: int) -> None:
-        active_slot_updates = int(active_slots.sum().detach().cpu().item())
+    def _record_cost(self, active_slots: Tensor | None, batch_size: int) -> None:
+        if active_slots is None:
+            self._cost_active_slot_updates.add_(batch_size * self.slot_count)
+        else:
+            self._cost_active_slot_updates.add_(active_slots.sum(dtype=torch.int64))
         self._cost = ContextSummaryCost(
             update_calls=self._cost.update_calls + 1,
-            active_slot_updates=self._cost.active_slot_updates + active_slot_updates,
+            active_slot_updates=0,
             estimated_element_updates=self._cost.estimated_element_updates
             + batch_size * self.slot_count * self.width,
         )
@@ -311,14 +362,18 @@ class ContextSummary(nn.Module):
             raise ValueError("context summary state tensors must use the same device")
         if type(state.step_index) is not int or not 0 <= state.step_index <= MAX_STEP_INDEX:
             raise ValueError("context summary step index is invalid")
-        if not bool(torch.isfinite(state.slots).all().detach().cpu().item()):
-            raise ValueError("context summary slots must be finite")
-        if bool((state.slots.abs() > 1.0).any().detach().cpu().item()):
-            raise ValueError("context summary slots must stay within [-1, 1]")
-        if bool((state.evidence < 0).any().detach().cpu().item()) or bool(
-            (state.evidence > self.max_evidence).any().detach().cpu().item()
-        ):
-            raise ValueError("context summary evidence is outside its limit")
+        _assert_tensor_condition(
+            torch.isfinite(state.slots).all(),
+            "context summary slots must be finite",
+        )
+        _assert_tensor_condition(
+            state.slots.abs().le(1.0).all(),
+            "context summary slots must stay within [-1, 1]",
+        )
+        _assert_tensor_condition(
+            state.evidence.ge(0).logical_and(state.evidence.le(self.max_evidence)).all(),
+            "context summary evidence is outside its limit",
+        )
 
     def _validate_values(self, values: Tensor, state: ContextSummaryState) -> None:
         if not isinstance(values, Tensor):
@@ -330,8 +385,7 @@ class ContextSummary(nn.Module):
             raise TypeError("values and state slots must use the same dtype")
         if values.device != state.slots.device:
             raise ValueError("values and state slots must use the same device")
-        if not bool(torch.isfinite(values).all().detach().cpu().item()):
-            raise ValueError("values must be finite")
+        _assert_tensor_condition(torch.isfinite(values).all(), "values must be finite")
 
     @staticmethod
     def _validate_mask(
@@ -460,3 +514,264 @@ class ContextSummary(nn.Module):
     def _validate_evidence_value(self, value: Any, name: str) -> None:
         if type(value) is not int or not 0 <= value <= self.max_evidence:
             raise ValueError(f"context summary payload {name} contains an invalid count")
+
+
+class SurpriseMemory(nn.Module):
+    """Small opt-in causal EMA memory gated by a bounded surprise signal."""
+
+    def __init__(
+        self,
+        width: int,
+        *,
+        memory_decay: float = 0.95,
+        momentum_decay: float = 0.90,
+        confidence_scale: float = DEFAULT_CONFIDENCE_SCALE,
+        max_evidence: int = 1024,
+        max_batch_size: int = DEFAULT_MAX_BATCH_SIZE,
+        max_state_elements: int = DEFAULT_MAX_STATE_ELEMENTS,
+    ) -> None:
+        super().__init__()
+        self.width = ContextSummary._require_positive_int(width, "width")
+        self.memory_decay = self._require_decay(memory_decay, "memory_decay")
+        self.momentum_decay = self._require_decay(momentum_decay, "momentum_decay")
+        self.confidence_scale = ContextSummary._require_positive_float(
+            confidence_scale, "confidence_scale"
+        )
+        self.max_evidence = ContextSummary._require_positive_int(max_evidence, "max_evidence")
+        self.max_batch_size = ContextSummary._require_positive_int(max_batch_size, "max_batch_size")
+        self.max_state_elements = ContextSummary._require_positive_int(
+            max_state_elements, "max_state_elements"
+        )
+        self.register_buffer(
+            "_device_anchor",
+            torch.empty((), dtype=torch.get_default_dtype()),
+            persistent=False,
+        )
+
+    def create_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> SurpriseMemoryState:
+        """Create a bounded zero state on the module device."""
+        batch_size = ContextSummary._require_positive_int(batch_size, "batch_size")
+        self._validate_state_size(batch_size)
+        target_device = self._resolve_device(device)
+        target_dtype = ContextSummary._resolve_dtype(dtype)
+        state = SurpriseMemoryState(
+            value=torch.zeros(batch_size, self.width, device=target_device, dtype=target_dtype),
+            momentum=torch.zeros(batch_size, self.width, device=target_device, dtype=target_dtype),
+            evidence=torch.zeros(batch_size, device=target_device, dtype=torch.int64),
+            step_index=0,
+        )
+        self._validate_state(state)
+        return state
+
+    def update(
+        self,
+        state: SurpriseMemoryState,
+        values: Tensor,
+        surprise: Tensor,
+        valid_mask: Tensor | None = None,
+        *,
+        detach: bool = False,
+    ) -> SurpriseMemoryState:
+        """Apply one causal surprise-gated EMA and momentum update."""
+        self._validate_state(state)
+        self._validate_module_device(state)
+        ContextSummary._validate_detach(detach)
+        self._validate_values(values, state)
+        self._validate_surprise(surprise, values)
+        valid_mask = ContextSummary._validate_mask(
+            valid_mask,
+            (values.shape[0],),
+            state.value.device,
+            "valid_mask",
+        )
+        if state.step_index >= MAX_STEP_INDEX:
+            raise ValueError("surprise memory step index reached its limit")
+
+        bounded_values = torch.tanh(values)
+        bounded_surprise = surprise.clamp(0.0, 1.0).unsqueeze(1)
+        candidate_momentum = (
+            self.momentum_decay * state.momentum
+            + (1.0 - self.momentum_decay) * bounded_values * bounded_surprise
+        ).clamp(-1.0, 1.0)
+        candidate_value = (
+            self.memory_decay * state.value
+            + (1.0 - self.memory_decay) * candidate_momentum
+        ).clamp(-1.0, 1.0)
+        if valid_mask is None:
+            next_value = candidate_value
+            next_momentum = candidate_momentum
+            next_evidence = (state.evidence + 1).clamp_max(self.max_evidence)
+        else:
+            next_value = torch.where(valid_mask.unsqueeze(1), candidate_value, state.value)
+            next_momentum = torch.where(
+                valid_mask.unsqueeze(1), candidate_momentum, state.momentum
+            )
+            next_evidence = (
+                state.evidence + valid_mask.to(dtype=torch.int64)
+            ).clamp_max(self.max_evidence)
+        if detach:
+            next_value = next_value.detach()
+            next_momentum = next_momentum.detach()
+            next_evidence = next_evidence.detach()
+        return SurpriseMemoryState(
+            value=next_value,
+            momentum=next_momentum,
+            evidence=next_evidence,
+            step_index=state.step_index + 1,
+        )
+
+    def read(self, state: SurpriseMemoryState, *, detach: bool = False) -> SurpriseMemoryRead:
+        """Read bounded memory with device-local confidence weighting."""
+        self._validate_state(state)
+        self._validate_module_device(state)
+        ContextSummary._validate_detach(detach)
+        evidence = state.evidence.to(dtype=state.value.dtype)
+        confidence = (
+            1.0 - torch.exp(-evidence / self.confidence_scale)
+        ).clamp(0.0, 1.0)
+        value = state.value * confidence.unsqueeze(1)
+        result = SurpriseMemoryRead(
+            value=value,
+            confidence=confidence,
+            evidence=state.evidence,
+            mask=state.evidence > 0,
+        )
+        if detach:
+            return SurpriseMemoryRead(
+                value=result.value.detach(),
+                confidence=result.confidence.detach(),
+                evidence=result.evidence.detach(),
+                mask=result.mask.detach(),
+            )
+        return result
+
+    def reset(self, state: SurpriseMemoryState) -> SurpriseMemoryState:
+        """Return an empty state preserving the input batch, device, and dtype."""
+        self._validate_state(state)
+        self._validate_module_device(state)
+        return self.create_state(
+            state.value.shape[0],
+            device=state.value.device,
+            dtype=state.value.dtype,
+        )
+
+    def _validate_module_device(self, state: SurpriseMemoryState) -> None:
+        if state.value.device != self._device_anchor.device:
+            raise ValueError("surprise memory module and state must use the same device")
+
+    def _validate_state(self, state: SurpriseMemoryState) -> None:
+        if not isinstance(state, SurpriseMemoryState):
+            raise TypeError("state must be a SurpriseMemoryState")
+        if not isinstance(state.value, Tensor) or not isinstance(state.momentum, Tensor):
+            raise TypeError("surprise memory state fields must be tensors")
+        if state.value.ndim != 2 or state.value.shape[1] != self.width:
+            raise ValueError("surprise memory value must have shape [batch, width]")
+        if state.momentum.shape != state.value.shape:
+            raise ValueError("surprise memory momentum shape is invalid")
+        if state.evidence.shape != (state.value.shape[0],):
+            raise ValueError("surprise memory evidence shape is invalid")
+        self._validate_state_size(state.value.shape[0])
+        ContextSummary._validate_floating_dtype(state.value.dtype, "surprise memory value")
+        if state.momentum.dtype != state.value.dtype:
+            raise TypeError("surprise memory momentum must use the value dtype")
+        if state.evidence.dtype != torch.int64:
+            raise TypeError("surprise memory evidence must use int64")
+        if state.value.device != state.momentum.device or state.value.device != state.evidence.device:
+            raise ValueError("surprise memory state tensors must use the same device")
+        if type(state.step_index) is not int or not 0 <= state.step_index <= MAX_STEP_INDEX:
+            raise ValueError("surprise memory step index is invalid")
+        _assert_tensor_condition(
+            torch.isfinite(state.value).all(),
+            "surprise memory value must be finite",
+        )
+        _assert_tensor_condition(
+            state.value.abs().le(1.0).all(),
+            "surprise memory value must stay within [-1, 1]",
+        )
+        _assert_tensor_condition(
+            torch.isfinite(state.momentum).all(),
+            "surprise memory momentum must be finite",
+        )
+        _assert_tensor_condition(
+            state.momentum.abs().le(1.0).all(),
+            "surprise memory momentum must stay within [-1, 1]",
+        )
+        _assert_tensor_condition(
+            state.evidence.ge(0).logical_and(state.evidence.le(self.max_evidence)).all(),
+            "surprise memory evidence is outside its limit",
+        )
+
+    def _validate_values(self, values: Tensor, state: SurpriseMemoryState) -> None:
+        if not isinstance(values, Tensor):
+            raise TypeError("values must be a tensor")
+        if values.shape != state.value.shape:
+            raise ValueError("values must have shape [batch, width]")
+        ContextSummary._validate_floating_dtype(values.dtype, "surprise memory values")
+        if values.dtype != state.value.dtype:
+            raise TypeError("surprise memory values and state must use the same dtype")
+        if values.device != state.value.device:
+            raise ValueError("surprise memory values and state must use the same device")
+        _assert_tensor_condition(torch.isfinite(values).all(), "surprise memory values must be finite")
+
+    @staticmethod
+    def _validate_surprise(surprise: Tensor, values: Tensor) -> None:
+        if not isinstance(surprise, Tensor):
+            raise TypeError("surprise must be a tensor")
+        if surprise.ndim != 1 or surprise.shape[0] != values.shape[0]:
+            raise ValueError("surprise must have shape [batch]")
+        if (
+            not torch.is_floating_point(surprise)
+            or torch.is_complex(surprise)
+            or surprise.dtype != values.dtype
+        ):
+            raise TypeError("surprise must be a real tensor with the values dtype")
+        if surprise.device != values.device:
+            raise ValueError("surprise and values must use the same device")
+        _assert_tensor_condition(torch.isfinite(surprise).all(), "surprise must be finite")
+
+    def _validate_state_size(self, batch_size: int) -> None:
+        batch_size = ContextSummary._require_positive_int(batch_size, "batch_size")
+        if batch_size > self.max_batch_size:
+            raise ValueError("surprise memory batch size exceeds its limit")
+        if batch_size * self.width * 2 > self.max_state_elements:
+            raise ValueError("surprise memory state exceeds its element limit")
+
+    def _resolve_device(self, device: torch.device | str | None) -> torch.device:
+        if device is None:
+            return self._device_anchor.device
+        if not isinstance(device, (torch.device, str)):
+            raise TypeError("device must be a torch.device or string")
+        try:
+            target_device = torch.device(device)
+        except (RuntimeError, TypeError) as error:
+            raise ValueError("surprise memory device is invalid") from error
+        if target_device.type == "meta":
+            raise ValueError("meta device is not supported for surprise memory state")
+        if target_device != self._device_anchor.device:
+            raise ValueError("surprise memory state device must match the module device")
+        return target_device
+
+    @staticmethod
+    def _require_decay(value: float, name: str) -> float:
+        if type(value) not in (int, float) or not math.isfinite(float(value)):
+            raise ValueError(f"{name} must be finite")
+        if not 0.0 <= float(value) < 1.0:
+            raise ValueError(f"{name} must be in [0, 1)")
+        return float(value)
+
+
+__all__ = [
+    "ContextSummary",
+    "ContextSummaryCost",
+    "ContextSummaryRead",
+    "ContextSummaryState",
+    "SurpriseMemory",
+    "SurpriseMemoryRead",
+    "SurpriseMemoryState",
+]

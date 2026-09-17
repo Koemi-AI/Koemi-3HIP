@@ -88,6 +88,33 @@ class BatchingModeTests(unittest.TestCase):
         self.assertEqual(15, batching_mode.metrics.padded_token_count)
         self.assertEqual(1, batching_mode.metrics.padding_token_count)
 
+    def test_padded_budget_splits_a_raw_token_fit_that_would_overfill_shape(self) -> None:
+        batching_mode = BatchingMode(
+            [2, 3],
+            max_batch_size=2,
+            max_tokens=5,
+            preserve_order=True,
+        )
+
+        microbatches = tuple(batching_mode)
+
+        self.assertEqual(((0,), (1,)), tuple(microbatch.sample_indices for microbatch in microbatches))
+        self.assertEqual((2, 3), tuple(microbatch.padded_token_count for microbatch in microbatches))
+        self.assertTrue(all(microbatch.padded_token_count <= 5 for microbatch in microbatches))
+
+    def test_length_bucket_boundaries_are_not_crossed(self) -> None:
+        batching_mode = BatchingMode(
+            [1, 2, 3, 4],
+            max_batch_size=4,
+            bucket_size=2,
+            preserve_order=False,
+        )
+
+        microbatches = tuple(batching_mode)
+
+        self.assertEqual(((0, 1), (2, 3)), tuple(microbatch.sample_indices for microbatch in microbatches))
+        self.assertEqual((4, 8), tuple(microbatch.padded_token_count for microbatch in microbatches))
+
     def test_aggregate_metrics_are_integer_token_counts(self) -> None:
         batching_mode = BatchingMode([2, 4, 3], max_batch_size=2, preserve_order=True)
 

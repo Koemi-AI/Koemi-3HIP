@@ -82,7 +82,10 @@ Training logs contain loss, thinking loss, surprise, valid-token count and
 expert activations. Validation loss/perplexity, optimizer steps, learning rate,
 precision and tokens/s are also reported. AdamW, warmup/cosine decay, gradient
 accumulation, label smoothing and AMP are configured through CLI flags. Example
-content is never logged.
+content is never logged. For variable-length corpora, `--max-batch-tokens` sets
+an optional budget on padded tokens per batch and `--length-bucket-size` keeps
+nearby lengths together. These flags activate the length-aware sampler; without
+them the original DataLoader order and batching path remain in place.
 
 ## Generate
 
@@ -111,6 +114,12 @@ does not start with it.
 output marker, for a checkpoint trained with thinking spans. `--raw-prompt` sends
 `--prompt` verbatim and prints the whole text, which is what a checkpoint trained
 on plain text needs; combining it with `--system` is refused.
+
+Serving code can call `prefill_batch` for a padded prompt batch and
+`decode_batch` for one-token recurrent steps. `InferenceBatchScheduler` keeps
+prefill and decode queues separate, groups compatible length buckets and
+returns padded tensors plus request handles; the caller owns model execution and
+calls `complete_batch` with outputs and isolated final states.
 
 The RAM cache reuses detached embeddings by token id. The optional mapping cache
 also writes fixed-width state snapshots at scan boundaries and at the end of a
@@ -358,7 +367,7 @@ and 16 of 64. The mixing form reaches 4 of 4 and 63 of 64.
 
 ## Experimental optimization fronts
 
-The repository also contains ten opt-in optimization seams in
+The repository also contains opt-in optimization seams in
 [`docs/HERM_OPTIMIZATION_LAB.md`](docs/HERM_OPTIMIZATION_LAB.md). They remain
 outside the default `KoemiModel` and trainer until hardware and quality gates
 are measured. `BulkPrefixCache` is available only when generation explicitly
@@ -368,7 +377,7 @@ selects it:
 | --- | --- | --- |
 | CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | PyTorch CUDA ops are implemented; no native `.cu` kernel or local CUDA timing |
 | Context | Multi-rate summary, exact prefix index, causal bounded admission | Summary is lossy; exact stores never perform semantic reuse |
-| Batching and bulk | Length-aware training plan, inference scheduler, exact RAM/SSD blocks, `BulkPrefixCache`, bounded async enqueue | `BulkPrefixCache` is opt-in at generation; schedulers and enqueue remain caller-owned; no end-to-end throughput claim |
+| Batching and bulk | Length-aware training sampler, prefill/decode APIs, inference scheduler, exact RAM/SSD blocks, `BulkPrefixCache`, bounded async enqueue | Bulk and scheduling remain opt-in; scheduler execution remains caller-owned; no end-to-end throughput claim |
 
 The local verification is CPU-only: the complete suite passes with conditional
 CUDA skips. This front records contracts and measurements to collect; it does
@@ -474,6 +483,8 @@ materialization counters, so a plan can be checked against the machine it ran on
 | `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
 | `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
 | `--num-workers` | `0` | DataLoader worker processes. |
+| `--max-batch-tokens` | none | Optional maximum padded tokens per training batch. |
+| `--length-bucket-size` | none | Optional sequence-length bucket width for training batches. |
 | `--ablation` | `no_refine` | Fast tier by default; `herm` enables refine, with `no_surprise` and `affine` controls. |
 | `--device` | CUDA if available | PyTorch device used for training or generation. |
 | `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
@@ -565,10 +576,13 @@ confidence gate or salient ring.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.
 - The optimization lab provides opt-in CUDA, context and batching seams. The
-  exact `BulkPrefixCache` path is connected to generation, but it is not part of
-  the default model or trainer. This CPU-only host has not measured CUDA overlap,
-  native kernel speed, end-to-end batching gain or context quality; exact SSD
-  block payloads are not encrypted.
+  exact `BulkPrefixCache` path and prefill/decode API are connected to explicit
+  generation callers, and the length-aware sampler is available through the two
+  training flags, but none changes the default model or loader path. Static
+  expert dispatch is inference-only while autograd and offload retain the
+  reference path for bit-exact contracts. This CPU-only host has not measured
+  CUDA overlap, native kernel speed, end-to-end batching gain or context quality;
+  exact SSD block payloads are not encrypted.
 
 ## Project layout
 

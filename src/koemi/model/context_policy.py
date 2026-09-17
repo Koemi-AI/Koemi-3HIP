@@ -23,6 +23,15 @@ class AdmissionReason(IntEnum):
 ADMISSION_REASON_COUNT = len(AdmissionReason)
 
 
+def _count_reasons(reason_codes: Tensor) -> Tensor:
+    reason_counts = torch.zeros(
+        (reason_codes.shape[0], ADMISSION_REASON_COUNT),
+        device=reason_codes.device,
+        dtype=torch.long,
+    )
+    return reason_counts.scatter_add_(1, reason_codes, torch.ones_like(reason_codes))
+
+
 @dataclass(frozen=True)
 class ContextSelection:
     """Result of one bounded, causal context-selection pass.
@@ -168,7 +177,9 @@ class ContextPolicy:
             observed_positions.to(decision_dtype), eligible_mask
         )
         detached_features = (
-            features.detach().to(decision_dtype) if features is not None else None
+            functional.normalize(features.detach().to(decision_dtype), dim=-1)
+            if features is not None
+            else None
         )
         detached_diversity = (
             diversity_scores.detach().to(decision_dtype)
@@ -254,11 +265,10 @@ class ContextPolicy:
         selected_mask = torch.zeros(
             (batch_size, candidate_count), device=device, dtype=torch.bool
         )
+        candidate_index = torch.empty((batch_size,), device=device, dtype=torch.long)
 
         for candidate_position in range(candidate_count):
-            candidate_index = torch.full(
-                (batch_size,), candidate_position, device=device, dtype=torch.long
-            )
+            candidate_index.fill_(candidate_position)
             candidate_position_value = observed_positions[:, candidate_position]
             candidate_observed = eligible_mask[:, candidate_position]
             candidate_identity = entry_ids[:, candidate_position]
@@ -277,8 +287,8 @@ class ContextPolicy:
                     novelty = detached_diversity[:, candidate_position].clamp(0.0, 1.0)
             else:
                 candidate_features = detached_features[:, candidate_position]
-                normalized_candidate = functional.normalize(candidate_features, dim=-1)
-                normalized_selected = functional.normalize(selected_features, dim=-1)
+                normalized_candidate = candidate_features
+                normalized_selected = selected_features
                 similarity = torch.einsum(
                     "bcd,bd->bc", normalized_selected, normalized_candidate
                 )
@@ -334,7 +344,7 @@ class ContextPolicy:
                 )
                 worst_slot = torch.where(
                     slot_is_worse,
-                    torch.full_like(worst_slot, slot_index),
+                    slot_index,
                     worst_slot,
                 )
             worst_priority = selected_priority_scores.gather(
@@ -369,7 +379,7 @@ class ContextPolicy:
             evicted_reason = reason_codes.gather(1, evicted_target).squeeze(1)
             evicted_reason = torch.where(
                 candidate_replaces,
-                torch.full_like(evicted_reason, int(AdmissionReason.EVICTED)),
+                int(AdmissionReason.EVICTED),
                 evicted_reason,
             )
             reason_codes = reason_codes.scatter(1, evicted_target, evicted_reason.unsqueeze(1))
@@ -381,27 +391,27 @@ class ContextPolicy:
             )
             candidate_reason = torch.where(
                 ~valid_mask[:, candidate_position],
-                torch.full_like(candidate_reason, int(AdmissionReason.INVALID)),
+                int(AdmissionReason.INVALID),
                 candidate_reason,
             )
             candidate_reason = torch.where(
                 future_mask[:, candidate_position],
-                torch.full_like(candidate_reason, int(AdmissionReason.FUTURE)),
+                int(AdmissionReason.FUTURE),
                 candidate_reason,
             )
             candidate_reason = torch.where(
                 duplicate_mask,
-                torch.full_like(candidate_reason, int(AdmissionReason.DUPLICATE)),
+                int(AdmissionReason.DUPLICATE),
                 candidate_reason,
             )
             candidate_reason = torch.where(
                 candidate_replaces,
-                torch.full_like(candidate_reason, int(AdmissionReason.REPLACED)),
+                int(AdmissionReason.REPLACED),
                 candidate_reason,
             )
             candidate_reason = torch.where(
                 candidate_admitted & ~candidate_replaces,
-                torch.full_like(candidate_reason, int(AdmissionReason.ADMITTED)),
+                int(AdmissionReason.ADMITTED),
                 candidate_reason,
             )
             reason_codes = reason_codes.scatter(
@@ -435,7 +445,7 @@ class ContextPolicy:
             )
             selected_valid = torch.where(
                 slot_mask,
-                torch.ones_like(selected_valid),
+                True,
                 selected_valid,
             )
             selected_priority_scores = torch.where(
@@ -490,9 +500,7 @@ class ContextPolicy:
             ordered_positions,
             torch.zeros_like(ordered_positions),
         )
-        reason_counts = functional.one_hot(
-            reason_codes, num_classes=ADMISSION_REASON_COUNT
-        ).sum(dim=1)
+        reason_counts = _count_reasons(reason_codes)
         return ContextSelection(
             selected_indices=ordered_indices,
             selected_mask=selected_mask,
@@ -682,9 +690,7 @@ class ContextPolicy:
             device=device,
             dtype=torch.long,
         )
-        reason_counts = functional.one_hot(
-            reason_codes, num_classes=ADMISSION_REASON_COUNT
-        ).sum(dim=1)
+        reason_counts = _count_reasons(reason_codes)
         return ContextSelection(
             selected_indices=torch.full(
                 (batch_size, self.capacity), -1, device=device, dtype=torch.long

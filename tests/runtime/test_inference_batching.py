@@ -10,7 +10,9 @@ from koemi.configuration.settings import PAD_TOKEN_ID
 from koemi.model.state import KoemiState
 from koemi.runtime.inference_batching import (
     BatchContract,
+    DECODE_PHASE,
     InferenceBatchScheduler,
+    PREFILL_PHASE,
 )
 
 
@@ -28,8 +30,12 @@ class FakeClock:
             self.value += seconds
 
 
-def make_contract(namespace: str = "tenant-a", model_id: str = "herm-test") -> BatchContract:
-    return BatchContract(model_id, torch.device("cpu"), torch.float32, namespace)
+def make_contract(
+    namespace: str = "tenant-a",
+    model_id: str = "herm-test",
+    phase: str = PREFILL_PHASE,
+) -> BatchContract:
+    return BatchContract(model_id, torch.device("cpu"), torch.float32, namespace, phase)
 
 
 def make_state(value: float) -> KoemiState:
@@ -106,7 +112,7 @@ class InferenceBatchSchedulerTests(unittest.TestCase):
         self.assertEqual(("request-2",), second_batch[0].request_ids)
         self.assertEqual(handles[0].request_id, first_batch[0].handles[0].request_id)
 
-    def test_item_and_real_token_limits_bound_each_emitted_batch(self) -> None:
+    def test_padded_token_budget_never_uses_raw_token_sum_to_overfill_a_batch(self) -> None:
         scheduler = InferenceBatchScheduler(
             max_wait_seconds=100.0,
             max_batch_items=3,
@@ -121,10 +127,85 @@ class InferenceBatchSchedulerTests(unittest.TestCase):
         remaining_batch = scheduler.flush(now=0.0)
 
         self.assertEqual(1, len(first_batch))
-        self.assertEqual(("one", "two"), first_batch[0].request_ids)
+        self.assertEqual((("one",),), tuple(batch.request_ids for batch in first_batch))
         self.assertLessEqual(len(first_batch[0].request_ids), 3)
         self.assertLessEqual(first_batch[0].token_count, 5)
-        self.assertEqual(("three",), remaining_batch[0].request_ids)
+        self.assertEqual(2, first_batch[0].padded_token_count)
+        self.assertEqual((("two",), ("three",)), tuple(batch.request_ids for batch in remaining_batch))
+        for batch in (*first_batch, *remaining_batch):
+            self.assertLessEqual(batch.padded_token_count, 5)
+
+    def test_length_buckets_keep_shapes_and_ordered_groups_separate(self) -> None:
+        scheduler = InferenceBatchScheduler(
+            max_wait_seconds=0.0,
+            max_batch_items=4,
+            max_batch_tokens=20,
+            length_bucket_size=2,
+            clock=lambda: 0.0,
+        )
+        scheduler.submit("length-one", torch.tensor([1]), make_contract())
+        scheduler.submit("length-two", torch.tensor([2, 3]), make_contract())
+        scheduler.submit("length-three", torch.tensor([4, 5, 6]), make_contract())
+        scheduler.submit("length-four", torch.tensor([7, 8, 9, 10]), make_contract())
+
+        batches = scheduler.poll(now=0.0)
+
+        self.assertEqual((("length-one", "length-two"), ("length-three", "length-four")),
+                         tuple(batch.request_ids for batch in batches))
+        self.assertEqual((4, 8), tuple(batch.padded_token_count for batch in batches))
+
+    def test_prefill_and_decode_phases_never_share_a_batch(self) -> None:
+        scheduler = InferenceBatchScheduler(
+            max_wait_seconds=0.0,
+            max_batch_items=4,
+            clock=lambda: 0.0,
+        )
+        scheduler.submit("prefill", torch.tensor([1, 2]), make_contract(phase=PREFILL_PHASE))
+        scheduler.submit(
+            "decode",
+            torch.tensor([3]),
+            make_contract(phase=DECODE_PHASE),
+            initial_state=make_state(1.0),
+        )
+
+        batches = scheduler.poll(now=0.0)
+
+        self.assertEqual((("prefill",), ("decode",)), tuple(batch.request_ids for batch in batches))
+        self.assertEqual((PREFILL_PHASE, DECODE_PHASE), tuple(batch.contract.phase for batch in batches))
+
+    def test_decode_contract_requires_one_token_and_a_recurrent_state(self) -> None:
+        scheduler = InferenceBatchScheduler(max_wait_seconds=0.0)
+        contract = make_contract(phase=DECODE_PHASE)
+
+        with self.assertRaises(ValueError):
+            scheduler.submit("too-many", torch.tensor([1, 2]), contract, initial_state=make_state(1.0))
+        with self.assertRaises(ValueError):
+            scheduler.submit("no-state", torch.tensor([1]), contract)
+
+    def test_decode_completion_requires_a_recurrent_final_state(self) -> None:
+        scheduler = InferenceBatchScheduler(max_wait_seconds=0.0, clock=lambda: 0.0)
+        handle = scheduler.submit(
+            "decode",
+            torch.tensor([1]),
+            make_contract(phase=DECODE_PHASE),
+            initial_state=make_state(1.0),
+        )
+        batch = scheduler.poll(now=0.0)[0]
+
+        with self.assertRaises(ValueError):
+            scheduler.complete_batch(batch, {"decode": "output"}, {"decode": None})
+
+        self.assertFalse(handle.done())
+
+    def test_cpu_transport_does_not_claim_pinned_async_h2d(self) -> None:
+        scheduler = InferenceBatchScheduler(max_wait_seconds=0.0, pin_memory=True, clock=lambda: 0.0)
+        scheduler.submit("cpu", torch.tensor([1, 2]), make_contract())
+
+        batch = scheduler.poll(now=0.0)[0]
+
+        self.assertEqual(torch.device("cpu"), batch.input_ids.device)
+        self.assertFalse(batch.pinned_host_memory)
+        self.assertFalse(batch.non_blocking_transfer)
 
     def test_states_and_results_remain_attached_to_their_request_ids(self) -> None:
         scheduler = InferenceBatchScheduler(

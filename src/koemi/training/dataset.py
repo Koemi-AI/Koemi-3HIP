@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
+import random
 
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from koemi.configuration.settings import PAD_TOKEN_ID
 from koemi.data.contracts import DatasetRecord, DatasetValidationError
 from koemi.data.serialization import serialize_record
+from koemi.training.batching_mode import BatchingMode
 
 
 IGNORE_TARGET_ID = -100
@@ -58,6 +61,50 @@ class CausalByteDataset(Dataset[CausalChunk]):
         return tuple(chunks)
 
 
+class _LengthAwareBatchSampler(Sampler[list[int]]):
+    """Rebuild a deterministic length-aware plan at the start of each epoch."""
+
+    def __init__(
+        self,
+        sample_lengths: tuple[int, ...],
+        max_batch_size: int,
+        max_batch_tokens: int | None,
+        length_bucket_size: int | None,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        self._sample_lengths = sample_lengths
+        self._max_batch_size = max_batch_size
+        self._max_batch_tokens = max_batch_tokens
+        self._length_bucket_size = length_bucket_size
+        self._shuffle = shuffle
+        self._seed = seed
+        self._epoch = 0
+        self._batch_count = len(self._build_plan(None))
+
+    def _build_plan(self, epoch: int | None) -> BatchingMode:
+        seed = None
+        if self._shuffle:
+            seed = self._seed if epoch is None else self._seed + epoch
+        return BatchingMode(
+            self._sample_lengths,
+            max_batch_size=self._max_batch_size,
+            max_tokens=self._max_batch_tokens,
+            bucket_size=self._length_bucket_size,
+            preserve_order=not self._shuffle,
+            seed=seed,
+        )
+
+    def __iter__(self) -> Iterator[list[int]]:
+        plan = self._build_plan(self._epoch)
+        self._epoch += 1
+        for microbatch in plan:
+            yield list(microbatch.sample_indices)
+
+    def __len__(self) -> int:
+        return self._batch_count
+
+
 def create_training_loader(
     dataset: CausalByteDataset,
     batch_size: int,
@@ -67,6 +114,8 @@ def create_training_loader(
     num_workers: int = 0,
     pin_memory: bool = False,
     prefetch_factor: int = 2,
+    max_batch_tokens: int | None = None,
+    length_bucket_size: int | None = None,
 ) -> DataLoader[CausalChunk]:
     if num_workers < 0:
         raise ValueError("num_workers must be non-negative")
@@ -75,6 +124,28 @@ def create_training_loader(
     worker_options = {}
     if num_workers > 0:
         worker_options = {"prefetch_factor": prefetch_factor, "persistent_workers": True}
+    if max_batch_tokens is not None or length_bucket_size is not None:
+        seed = (
+            generator.initial_seed()
+            if generator is not None
+            else random.SystemRandom().randrange(0, 2**63)
+        )
+        batch_sampler = _LengthAwareBatchSampler(
+            tuple(len(chunk.input_ids) for chunk in dataset.chunks),
+            batch_size,
+            max_batch_tokens,
+            length_bucket_size,
+            bool(shuffle),
+            seed,
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_chunks,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            **worker_options,
+        )
     return DataLoader(
         dataset,
         batch_size=batch_size,

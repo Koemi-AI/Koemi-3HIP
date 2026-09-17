@@ -79,6 +79,18 @@ def create_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num-workers", type=int, default=0)
     train_parser.add_argument("--prefetch-factor", type=int, default=2)
     train_parser.add_argument("--no-pin-memory", action="store_true")
+    train_parser.add_argument(
+        "--max-batch-tokens",
+        type=int,
+        default=None,
+        help="Optional padded-token budget for length-aware training batches",
+    )
+    train_parser.add_argument(
+        "--length-bucket-size",
+        type=int,
+        default=None,
+        help="Optional token-length bucket width for training batches",
+    )
     add_offload_arguments(train_parser)
     add_model_arguments(train_parser)
 
@@ -240,6 +252,8 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         num_workers=arguments.num_workers,
         pin_memory=not arguments.no_pin_memory,
         prefetch_factor=arguments.prefetch_factor,
+        max_batch_tokens=arguments.max_batch_tokens,
+        length_bucket_size=arguments.length_bucket_size,
     )
     effective_pin_memory = training_settings.pin_memory and training_settings.device.startswith("cuda")
     training_records, validation_records = split_dataset_records(
@@ -253,6 +267,8 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         num_workers=training_settings.num_workers,
         pin_memory=effective_pin_memory,
         prefetch_factor=training_settings.prefetch_factor,
+        max_batch_tokens=training_settings.max_batch_tokens,
+        length_bucket_size=training_settings.length_bucket_size,
     )
     validation_loader = None
     if validation_records:
@@ -264,6 +280,8 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
             num_workers=training_settings.num_workers,
             pin_memory=effective_pin_memory,
             prefetch_factor=training_settings.prefetch_factor,
+            max_batch_tokens=training_settings.max_batch_tokens,
+            length_bucket_size=training_settings.length_bucket_size,
         )
     model = KoemiModel(model_settings)
     engine = attach_offload(model, loader, training_settings.device, arguments, logger)

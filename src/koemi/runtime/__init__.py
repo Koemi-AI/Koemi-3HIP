@@ -1,4 +1,14 @@
 from koemi.runtime.bulk_prefix_cache import BulkPrefixCache
+from koemi.runtime.inference_batching import (
+    DECODE_PHASE,
+    PREFILL_PHASE,
+    BatchContract,
+    BatchingMetrics,
+    InferenceBatch,
+    InferenceBatchScheduler,
+    InferenceRequestHandle,
+    InferenceResult,
+)
 from koemi.runtime.offload import (
     ACCELERATOR_TIER,
     DISK_TIER,
@@ -20,6 +30,9 @@ from koemi.runtime.offload import (
 
 __all__ = [
     "BulkPrefixCache",
+    "BatchContract",
+    "BatchingMetrics",
+    "DECODE_PHASE",
     "ACCELERATOR_TIER",
     "DISK_TIER",
     "HOST_TIER",
@@ -30,7 +43,12 @@ __all__ = [
     "OffloadError",
     "OffloadRequest",
     "OffloadStatistics",
+    "InferenceBatch",
+    "InferenceBatchScheduler",
+    "InferenceRequestHandle",
+    "InferenceResult",
     "PlacementPlan",
+    "PREFILL_PHASE",
     "ResidencyCache",
     "TierBudget",
     "calibrate_traffic",
