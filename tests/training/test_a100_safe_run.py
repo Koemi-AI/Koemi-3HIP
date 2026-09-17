@@ -8,6 +8,7 @@ from pathlib import Path
 from koemi.training.a100_safe_run import (
     COST_PER_HOUR_USD,
     SafeA100Plan,
+    aggressive_plan,
     build_run_configuration,
     main,
     parse_arguments,
@@ -26,6 +27,15 @@ class SafeA100RunTests(unittest.TestCase):
         self.assertEqual(47.48, round(plan.requested_cost_usd, 2))
         self.assertEqual(1190.04, round(plan.budget_cost_usd, 2))
         self.assertEqual(256, plan.sequence_length)
+
+    def test_aggressive_plan_uses_the_large_moe_profile(self) -> None:
+        plan = aggressive_plan(Path("results"))
+
+        self.assertEqual("aggressive", plan.profile)
+        self.assertEqual(200_000, plan.target_record_count)
+        self.assertEqual(512, plan.sequence_length)
+        self.assertEqual(1_152, plan.model_settings.embedding_size)
+        self.assertEqual(128, plan.model_settings.expert_count)
 
     def test_plan_maps_to_the_existing_checkpointed_runner(self) -> None:
         plan = SafeA100Plan(Path("results"))

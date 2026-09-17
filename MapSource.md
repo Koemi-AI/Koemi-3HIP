@@ -66,6 +66,10 @@ com baselines ainda precisam ser fechados.
   plano local, preflight BF16 forward/backward pequeno, ledger conservador de
   custo e treino confirmado explicitamente; alvo padrao de 0.205B e 45.000
   registros de codigo.
+- Perfil A100 agressivo: largura 1.152 (~1.035B parametros), 128 experts/top-6,
+  sequencia 512, corpus limitado a 200.000 registros e calibracao ampliada de
+  microbatch ate o limite medido de VRAM; `BulkPrefixCache` permanece somente
+  para inferencia exata.
 
 ### Out of scope
 
@@ -133,6 +137,8 @@ com baselines ainda precisam ser fechados.
 - [x] Launcher A100 seguro gera plano sem rede/GPU, bloqueia treino sem
   confirmacao financeira, executa testes locais de ledger e documenta o
   preflight real antes do corpus remoto.
+- [x] Perfil agressivo gera plano separado e calibra microbatch na GPU real;
+  BulkPrefixCache nao e aplicado ao treino porque isso eliminaria gradientes.
 
 ### Assumptions
 

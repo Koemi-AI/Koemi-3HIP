@@ -9,6 +9,7 @@ budget confirmation before opening the remote dataset streams.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 import json
 import math
@@ -38,6 +39,7 @@ DEFAULT_EVALUATION_BATCHES = 32
 @dataclass(frozen=True)
 class SafeA100Plan:
     results_directory: Path
+    profile: str = "safe"
     budget_hours: float = DEFAULT_BUDGET_HOURS
     session_hours: float = DEFAULT_SESSION_HOURS
     data_seed: int = 20260916
@@ -59,10 +61,15 @@ class SafeA100Plan:
     checkpoint_interval_minutes: int = DEFAULT_CHECKPOINT_MINUTES
     log_interval_steps: int = DEFAULT_LOG_INTERVAL_STEPS
     evaluation_batches: int = DEFAULT_EVALUATION_BATCHES
+    model_settings: canonical.ModelSettings | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.results_directory, Path):
             raise TypeError("results_directory must be a Path")
+        if self.profile not in {"safe", "aggressive"}:
+            raise ValueError("profile must be safe or aggressive")
+        if self.model_settings is None:
+            object.__setattr__(self, "model_settings", canonical.model_settings())
         for value, name in (
             (self.budget_hours, "budget_hours"),
             (self.session_hours, "session_hours"),
@@ -111,6 +118,7 @@ class SafeA100Plan:
         return {
             "safe_run_format_version": SAFE_RUN_FORMAT_VERSION,
             "results_directory": str(self.results_directory),
+            "profile": self.profile,
             "budget_hours": self.budget_hours,
             "session_hours": self.session_hours,
             "requested_session_cost_usd": round(self.requested_cost_usd, 2),
@@ -128,8 +136,33 @@ class SafeA100Plan:
             "checkpoint_interval_minutes": self.checkpoint_interval_minutes,
             "log_interval_steps": self.log_interval_steps,
             "evaluation_batches": self.evaluation_batches,
-            "model_settings": canonical.model_settings().to_dict(),
+            "model_settings": self.model_settings.to_dict(),
         }
+
+
+def aggressive_plan(results_directory: Path, budget_hours: float = DEFAULT_BUDGET_HOURS, session_hours: float = DEFAULT_SESSION_HOURS) -> SafeA100Plan:
+    return SafeA100Plan(
+        results_directory=results_directory,
+        profile="aggressive",
+        budget_hours=budget_hours,
+        session_hours=session_hours,
+        sequence_length=512,
+        quotas=canonical.CorpusQuotas(50_000, 60_000, 40_000, 35_000, 15_000),
+        opencode_scan_limit=500_000,
+        source_scan_limit=150_000,
+        shuffle_buffer_size=8_192,
+        evaluation_batches=64,
+        model_settings=canonical.ModelSettings(
+            embedding_size=1_152,
+            memory_features=16,
+            local_memory_size=32,
+            salience_memory_size=32,
+            expert_count=128,
+            expert_top_k=6,
+            scan_chunk=128,
+            ablation="no_refine",
+        ),
+    )
 
 
 def build_run_configuration(plan: SafeA100Plan) -> canonical.RunConfiguration:
@@ -148,6 +181,44 @@ def build_run_configuration(plan: SafeA100Plan) -> canonical.RunConfiguration:
         log_interval_steps=plan.log_interval_steps,
         evaluation_batches=plan.evaluation_batches,
     )
+
+
+def _aggressive_calibrate_batch_size(
+    settings: canonical.ModelSettings,
+    dataset: canonical.MaterializedCausalByteDataset,
+    device: torch.device,
+    model_seed: int,
+) -> tuple[int, list[dict[str, Any]]]:
+    candidates = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64)
+    reports = [
+        canonical.benchmark_batch_size(settings, dataset, device, model_seed, candidate)
+        for candidate in candidates
+    ]
+    total_memory = torch.cuda.get_device_properties(device).total_memory
+    safe_reports = [
+        report
+        for report in reports
+        if report["status"] == "ok"
+        and report["peak_memory_bytes"] <= int(total_memory * 0.92)
+    ]
+    if not safe_reports:
+        raise RuntimeError(f"no aggressive batch fits the measured A100 memory budget: {reports}")
+    selected = max(safe_reports, key=lambda report: report["supervised_tokens_per_second"])
+    return int(selected["batch_size"]), reports
+
+
+@contextmanager
+def _apply_profile(plan: SafeA100Plan):
+    original_model_settings = canonical.model_settings
+    original_calibration = canonical.calibrate_batch_size
+    canonical.model_settings = lambda: plan.model_settings
+    if plan.profile == "aggressive":
+        canonical.calibrate_batch_size = _aggressive_calibrate_batch_size
+    try:
+        yield
+    finally:
+        canonical.model_settings = original_model_settings
+        canonical.calibrate_batch_size = original_calibration
 
 
 def _budget_path(plan: SafeA100Plan) -> Path:
@@ -298,14 +369,15 @@ def run_safe_training(plan: SafeA100Plan) -> dict[str, Any]:
             "corpus_manifest": corpus_manifest,
         }
         canonical.atomic_write_json(plan.results_directory / "dataset_report.json", dataset_report)
-        session_report = canonical.run_training(
-            configuration,
-            corpus_manifest,
-            training_dataset,
-            validation_dataset,
-            device,
-            environment,
-        )
+        with _apply_profile(plan):
+            session_report = canonical.run_training(
+                configuration,
+                corpus_manifest,
+                training_dataset,
+                validation_dataset,
+                device,
+                environment,
+            )
         final_report = {
             "safe_plan": plan.to_dict(),
             "environment": environment,
@@ -324,16 +396,21 @@ def run_safe_training(plan: SafeA100Plan) -> dict[str, Any]:
 def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, float | None]:
     parser = argparse.ArgumentParser(description="Conservative Koemi A100 code-training launcher")
     parser.add_argument("--mode", choices=("plan", "preflight", "train"), default="plan")
+    parser.add_argument("--profile", choices=("safe", "aggressive"), default="safe")
     parser.add_argument("--results-dir", default="koemi-a100-safe-v1")
     parser.add_argument("--budget-hours", type=float, default=DEFAULT_BUDGET_HOURS)
     parser.add_argument("--session-hours", type=float, default=DEFAULT_SESSION_HOURS)
     parser.add_argument("--confirm-budget-hours", type=float, default=None)
     arguments = parser.parse_args(argv)
-    plan = SafeA100Plan(
-        results_directory=Path(arguments.results_dir).expanduser().resolve(),
-        budget_hours=arguments.budget_hours,
-        session_hours=arguments.session_hours,
-    )
+    results_directory = Path(arguments.results_dir).expanduser().resolve()
+    if arguments.profile == "aggressive":
+        plan = aggressive_plan(results_directory, arguments.budget_hours, arguments.session_hours)
+    else:
+        plan = SafeA100Plan(
+            results_directory=results_directory,
+            budget_hours=arguments.budget_hours,
+            session_hours=arguments.session_hours,
+        )
     return arguments.mode, plan, arguments.confirm_budget_hours
 
 
@@ -362,6 +439,7 @@ __all__ = [
     "DEFAULT_SESSION_HOURS",
     "SafeA100Plan",
     "build_run_configuration",
+    "aggressive_plan",
     "main",
     "parse_arguments",
     "reserve_budget",

@@ -5,6 +5,11 @@ It is a Python module, not a notebook containing a giant embedded source or
 JSON payload. The old notebook remains available as a legacy path; this runner
 is the safer path for a paid session.
 
+The launcher also has an `aggressive` profile for an A100 80 GB. It is the
+profile to use when the objective is maximum useful training work in one 7.5
+hour session. It is intentionally a separate profile because its model and
+corpus are substantially larger and require a fresh preflight.
+
 ## Budget and target
 
 At US$ 6.33 per hour, 188 hours represent US$ 1,190.04. The default plan uses
@@ -59,11 +64,37 @@ or budget reservation. Each session writes the plan, environment, contract
 results, corpus manifest, dataset report, checkpoints, final report, and
 `safe_budget_state.json`.
 
+For the aggressive run, use a separate Drive directory and repeat both `plan`
+and `preflight` first:
+
+```bash
+python -m koemi.training.a100_safe_run --mode plan --profile aggressive \
+  --results-dir /content/drive/MyDrive/koemi-a100-aggressive-v1
+
+python -m koemi.training.a100_safe_run --mode preflight --profile aggressive \
+  --results-dir /content/drive/MyDrive/koemi-a100-aggressive-v1
+
+python -m koemi.training.a100_safe_run --mode train --profile aggressive \
+  --results-dir /content/drive/MyDrive/koemi-a100-aggressive-v1 \
+  --confirm-budget-hours 188
+```
+
+This profile uses width 1,152 (approximately 1.035B parameters), 128 experts,
+top-6 dispatch, sequence length 512, 200,000 bounded records and an expanded
+microbatch calibration. The selected batch is measured on the actual GPU; it
+is not hard-coded from the local CPU machine.
+
 The data sources remain pinned and validated by `a100_run.py`. The reduced
 quotas are 10,000 OpenCode priority, 15,000 OpenCode general, 10,000
 CodeFeedback, 8,000 Magicoder, and 2,000 OpenR1 Math records. The runner keeps
 prefix caches out of training and does not treat semantically similar prompts
 as identical state.
+
+`BatchMode` is useful at the loader/calibration boundary and is represented here
+by measured microbatch selection and pinned DataLoader transfers. `BulkMode`
+(`BulkPrefixCache`) is intentionally not used during training: it is an exact
+prefix-state cache for inference, and reusing it across training examples would
+skip gradients and make the optimization incorrect.
 
 ## What this does not claim
 

@@ -526,6 +526,12 @@ the explicitly confirmed training session. Its default target is the existing
 approximately 0.205B-parameter model with 45,000 code-focused records across
 25 resumable 7.5-hour sessions.
 
+For maximum A100 utilization, the same launcher supports
+`--profile aggressive`: approximately 1.035B parameters, 128 experts/top-6,
+sequence 512, 200,000 bounded records and GPU-measured microbatch calibration.
+Run its separate plan and preflight before training; `BulkPrefixCache` remains
+inference-only because skipping exact training prefixes would skip gradients.
+
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json
