@@ -519,6 +519,13 @@ Terminal-Bench and BigCodeBench remain evaluation-only and are not downloaded by
 the training cell. Dataset revisions, quotas, checkpoint format, and known limits
 are recorded in [`docs/A100_CODE_REASONING_TRAINING.md`](docs/A100_CODE_REASONING_TRAINING.md).
 
+For a bounded paid run without a large notebook payload, use the conservative
+Python launcher in [`docs/A100_SAFE_TRAINING.md`](docs/A100_SAFE_TRAINING.md).
+It separates local planning, a small real-A100 forward/backward preflight, and
+the explicitly confirmed training session. Its default target is the existing
+approximately 0.205B-parameter model with 45,000 code-focused records across
+25 resumable 7.5-hour sessions.
+
 ```bash
 .venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
 .venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json

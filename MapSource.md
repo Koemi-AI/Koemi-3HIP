@@ -62,6 +62,10 @@ com baselines ainda precisam ser fechados.
 - Memoria experimental: `SurpriseMemory` causal com EMA/momentum bounded e
   `scan_and_read_microblocks` para limitar intermediarios pairwise sem prometer
   reducao da complexidade quadratica.
+- Execucao A100 segura: launcher Python sem notebook/JSON embutido grande,
+  plano local, preflight BF16 forward/backward pequeno, ledger conservador de
+  custo e treino confirmado explicitamente; alvo padrao de 0.205B e 45.000
+  registros de codigo.
 
 ### Out of scope
 
@@ -126,6 +130,9 @@ com baselines ainda precisam ser fechados.
   zero para blocos exatos e politica de criptografia SSD decidida.
 - [ ] BatchingMode e os schedulers passam integracao real com trainer/generation,
   sem perda de ordem, estado, mascara, deadlines ou isolamento entre requests.
+- [x] Launcher A100 seguro gera plano sem rede/GPU, bloqueia treino sem
+  confirmacao financeira, executa testes locais de ledger e documenta o
+  preflight real antes do corpus remoto.
 
 ### Assumptions
 
@@ -191,6 +198,8 @@ flowchart LR
   gradient-accumulation boundaries.
 - `src/koemi/training/a100_run.py` - pinned corpus, A100 preflight, calibration,
   BF16 loop, metrics and rotating Drive checkpoints.
+- `src/koemi/training/a100_safe_run.py` - plano conservador, preflight pequeno,
+  trava explicita de budget e ledger de sessoes A100.
 - `src/koemi/training/checkpoints.py` - weights-only checkpoint contract.
 - `src/koemi/training/generation.py` - longest-prefix resume, prefill batches,
   recurrent decode batches and stateful generation.
@@ -232,10 +241,14 @@ flowchart LR
 - `src/koemi/training/objective.py` - weighted token cross entropy.
 - `src/koemi/training/a100_run.py` - source adapters, corpus manifest, batch
   sampler, CUDA preflight, checkpoint payload and overnight session contract.
+- `src/koemi/training/a100_safe_run.py` - local plan, real-device micro
+  preflight, exact budget confirmation and conservative accounting.
 - `notebooks/Koemi-3HIP_A100.ipynb` - self-contained Colab setup, embedded
   runner, internal tests and nine-hour A100 invocation.
 - `docs/A100_CODE_REASONING_TRAINING.md` - research-backed corpus and runtime
   decisions, licenses, exclusions and limitations.
+- `docs/A100_SAFE_TRAINING.md` - comandos e limites do runner A100 sem payload
+  embutido grande.
 
 ## Decisions
 
@@ -729,6 +742,9 @@ already have allocated an over-budget tensor.
 - [ ] Frente de otimizacao HERM: executar CUDA real, medir forward/backward,
   streams, VRAM, padding, fila, hit-rate e throughput end-to-end em hardware
   alvo antes de promover qualquer seam.
+- [x] Frente A100 segura, 2026-09-16: runner separado do notebook, alvo
+  0.205B, 45.000 registros, 25 sessoes de 7,5h, custo calculado em
+  US$ 1.190,04, preflight pequeno e confirmacao obrigatoria antes da rede.
 
 ## Suspicion zone
 
@@ -1849,3 +1865,18 @@ already have allocated an over-budget tensor.
   passed 53 tests with one conditional CUDA skip. The complete command passed
   300 tests with 13 conditional CUDA skips, and `compileall` passed.
   CUDA execution, overlap, performance and context quality remain unverified.
+
+### 2026-09-16 - Conservative A100 launcher
+
+- Added `src/koemi/training/a100_safe_run.py` and its focused tests. `plan` is
+  local-only, `preflight` performs one small real-device BF16 forward/backward
+  probe, and `train` refuses to access remote data without an exact budget
+  confirmation.
+- The default plan keeps the existing approximately 0.205B model and bounds
+  the corpus at 45.000 code-focused records. It budgets 25 sessions of 7,5h
+  from the user's 188h at US$ 6,33/h, leaving 0,5h reserve; a JSON ledger
+  records reservations, actual duration, status and cost.
+- Local `plan` execution and four focused tests pass. The A100 preflight,
+  remote dataset access, throughput, quality and complete paid run remain
+  unverified because this host is CPU-only. The old embedded notebook was not
+  modified; the new runner is the documented small-payload path.
