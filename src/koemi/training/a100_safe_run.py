@@ -294,7 +294,7 @@ def run_a100_preflight(plan: SafeA100Plan) -> dict[str, Any]:
     device, environment = canonical.configure_a100()
     torch.manual_seed(plan.model_seed)
     torch.cuda.manual_seed_all(plan.model_seed)
-    model = KoemiModel(canonical.model_settings()).to(device)
+    model = KoemiModel(plan.model_settings).to(device)
     canonical_report = canonical.run_cuda_preflight(model, device)
     model.train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01)

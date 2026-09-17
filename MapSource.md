@@ -1897,3 +1897,13 @@ already have allocated an over-budget tensor.
   a regression test covers module dispatch under BF16 autocast. The focused
   dispatch suite passed 16 tests and the complete suite passed 306 tests with
   13 conditional CUDA skips. The fix is ready for a new remote preflight.
+
+### 2026-09-17 - Aggressive preflight model-selection fix
+
+- The first aggressive preflight exposed that `run_a100_preflight` still
+  instantiated `canonical.model_settings()`, reporting the safe 0.205B model
+  despite the aggressive 1.035B plan. Training was not authorized from that
+  report.
+- The preflight now instantiates `plan.model_settings`; a meta-device regression
+  test asserts the aggressive profile has exactly 1,035,177,107 parameters.
+  The corrected preflight must be rerun before any aggressive training.

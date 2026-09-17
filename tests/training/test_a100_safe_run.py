@@ -5,6 +5,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import torch
+
+from koemi.model.network import KoemiModel
 from koemi.training.a100_safe_run import (
     COST_PER_HOUR_USD,
     SafeA100Plan,
@@ -15,6 +18,12 @@ from koemi.training.a100_safe_run import (
     reserve_budget,
     settle_budget,
 )
+
+
+def _parameter_count(settings) -> int:
+    with torch.device("meta"):
+        model = KoemiModel(settings)
+    return sum(parameter.numel() for parameter in model.parameters())
 
 
 class SafeA100RunTests(unittest.TestCase):
@@ -36,6 +45,7 @@ class SafeA100RunTests(unittest.TestCase):
         self.assertEqual(512, plan.sequence_length)
         self.assertEqual(1_152, plan.model_settings.embedding_size)
         self.assertEqual(128, plan.model_settings.expert_count)
+        self.assertEqual(1_035_177_107, _parameter_count(plan.model_settings))
 
     def test_plan_maps_to_the_existing_checkpointed_runner(self) -> None:
         plan = SafeA100Plan(Path("results"))
