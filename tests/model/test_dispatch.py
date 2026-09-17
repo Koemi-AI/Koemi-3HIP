@@ -218,6 +218,19 @@ class ContentDispatchTests(unittest.TestCase):
                     )
                 )
 
+    def test_module_dispatch_accepts_autocast_expert_outputs(self) -> None:
+        mixture = build_mixture(4, top_k=1)
+        context = torch.randn(1, 4, 16)
+        token_ids = torch.tensor([[65, 66, 67, PAD_TOKEN_ID]], dtype=torch.long)
+        previous_ids = torch.tensor([[32, 65, 66, 67]], dtype=torch.long)
+        valid_mask = token_ids != PAD_TOKEN_ID
+
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            mixed_context, _, _ = mixture(context, token_ids, previous_ids, valid_mask)
+
+        self.assertEqual(context.dtype, mixed_context.dtype)
+        self.assertTrue(bool(torch.isfinite(mixed_context).all()))
+
 
 class DispatchThroughTheModelTests(unittest.TestCase):
     def build_model(self, expert_count: int) -> KoemiModel:

@@ -109,7 +109,11 @@ class DeterministicExpertMixture(nn.Module):
             if row_indices.numel() == 0:
                 continue
             expert_context = expert(flattened_context.index_select(0, row_indices))
-            expert_updates.index_add_(0, row_indices, expert_context / self.top_k)
+            expert_updates.index_add_(
+                0,
+                row_indices,
+                (expert_context / self.top_k).to(dtype=expert_updates.dtype),
+            )
         valid_rows = valid_mask.reshape(-1)
         updated_context = self.output_normalizer(flattened_context + expert_updates)
         mixed_context = torch.where(valid_rows.unsqueeze(-1), updated_context, flattened_context)

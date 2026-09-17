@@ -1880,3 +1880,14 @@ already have allocated an over-budget tensor.
   remote dataset access, throughput, quality and complete paid run remain
   unverified because this host is CPU-only. The old embedded notebook was not
   modified; the new runner is the documented small-payload path.
+
+### 2026-09-17 - A100 BF16 expert dispatch hotfix
+
+- The real A100 preflight reproduced a dtype failure in
+  `src/koemi/model/experts.py`: module dispatch allocated a FP32 update buffer
+  while autocast returned BF16 expert outputs, and `index_add_` rejected the
+  mismatch.
+- The update path now casts each expert contribution to the accumulator dtype;
+  a regression test covers module dispatch under BF16 autocast. The focused
+  dispatch suite passed 16 tests and the complete suite passed 306 tests with
+  13 conditional CUDA skips. The fix is ready for a new remote preflight.
